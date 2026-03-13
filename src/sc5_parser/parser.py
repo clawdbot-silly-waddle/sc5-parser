@@ -140,6 +140,8 @@ class SC5File:
     def _parse(self) -> None:
         raw = self.sc_path.read_bytes()
 
+        if len(raw) < 10:
+            raise ValueError(f"Invalid SC file: too small ({len(raw)} bytes)")
         if raw[:2] != b"SC":
             raise ValueError(f"Not an SC file: {self.sc_path}")
         version = struct.unpack("<I", raw[2:6])[0]
@@ -535,12 +537,14 @@ class SC5File:
                         if elem.child_index < len(mcd.children_blending)
                         else 0
                     )
+                    # Propagate parent blend: if parent says additive, children inherit
+                    effective_blend = child_blend if child_blend != 0 else blend_mode
 
                     child_parts = self._render_object(
                         child_id, texture_images, combined, visited,
                         child_color if child_color is not ColorTransform.IDENTITY else color,
                         frame_label, depth + 1,
-                        blend_mode=child_blend,
+                        blend_mode=effective_blend,
                     )
 
                     if capture_mask:
@@ -573,10 +577,11 @@ class SC5File:
                         if idx < len(mcd.children_blending)
                         else 0
                     )
+                    effective_blend = child_blend if child_blend != 0 else blend_mode
                     rendered.extend(self._render_object(
                         child_id, texture_images, parent_matrix, visited,
                         color, frame_label, depth + 1,
-                        blend_mode=child_blend,
+                        blend_mode=effective_blend,
                     ))
             # else: selected frame explicitly has 0 elements — nothing visible
             visited.discard(obj_id)
@@ -801,8 +806,8 @@ def _additive_blend(
 ) -> None:
     """In-place additive blend of overlay onto base at (px, py).
 
-    For each pixel: base_rgb += overlay_rgb * overlay_alpha / 255,
-    base_alpha = max(base_alpha, overlay_alpha).
+    Additive blend adds brightness to existing content without introducing new
+    opacity.  base_rgb += overlay_rgb * overlay_alpha / 255; alpha stays as-is.
     """
     ow, oh = overlay.size
     bw, bh = base.size
@@ -822,7 +827,7 @@ def _additive_blend(
     alpha = oslice[:, :, 3:4]  # (h, w, 1) broadcast
     # Add RGB weighted by overlay alpha
     bslice[:, :, :3] = np.minimum(bslice[:, :, :3] + oslice[:, :, :3] * alpha // 255, 255)
-    # Alpha: take max
+    # Alpha: take max so additive content is visible in extraction
     bslice[:, :, 3] = np.maximum(bslice[:, :, 3], oslice[:, :, 3])
 
     base_arr[y1:y2, x1:x2] = bslice.astype(np.uint8)
