@@ -8,6 +8,7 @@ and named exports for downstream extraction.
 from __future__ import annotations
 
 import struct
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,55 @@ from sc5_parser.renderer import render_command
 
 ShapeDict = dict[str, Any]
 
+# Sentinel: "no matrix" / "no color transform" in frame elements
+_NO_TRANSFORM = 0xFFFF
+
+
+@dataclass
+class Matrix2x3:
+    """Affine 2×3 transformation matrix (a b c d tx ty)."""
+    a: float = 1.0
+    b: float = 0.0
+    c: float = 0.0
+    d: float = 1.0
+    tx: float = 0.0
+    ty: float = 0.0
+
+    IDENTITY: Matrix2x3 = None  # type: ignore[assignment]  # set below
+
+    def __matmul__(self, other: Matrix2x3) -> Matrix2x3:
+        """Compose two 2×3 affine matrices: ``self @ other``."""
+        return Matrix2x3(
+            a=self.a * other.a + self.b * other.c,
+            b=self.a * other.b + self.b * other.d,
+            c=self.c * other.a + self.d * other.c,
+            d=self.c * other.b + self.d * other.d,
+            tx=self.a * other.tx + self.b * other.ty + self.tx,
+            ty=self.c * other.tx + self.d * other.ty + self.ty,
+        )
+
+
+Matrix2x3.IDENTITY = Matrix2x3()
+
+
+@dataclass
+class FrameElement:
+    """One visible child in a MovieClip frame."""
+    child_index: int
+    matrix_index: int
+    color_index: int
+
+
+@dataclass
+class MovieClipData:
+    """Parsed MovieClip with frame element data."""
+    id: int
+    children_ids: list[int] = field(default_factory=list)
+    children_names: list[str] = field(default_factory=list)
+    frame_elements_offset: int = 0xFFFFFFFF
+    matrix_bank_index: int = 0
+    frame_element_counts: list[int] = field(default_factory=list)
+
 
 class SC5File:
     """Parsed representation of an SC v5 file."""
@@ -35,9 +85,12 @@ class SC5File:
         self.exports: dict[str, int] = {}  # name → movie-clip / shape id
         self.textures: list[dict[str, Any]] = []
         self.movie_clips: dict[int, dict[str, Any]] = {}
+        self.movie_clip_data: dict[int, MovieClipData] = {}
         self.strings: list[str] = []
         self.vertices: list[tuple[float, float, int, int]] = []
         self._shape_id_to_idx: dict[int, list[int]] = {}
+        self._frame_elements: np.ndarray | None = None
+        self._matrix_banks: list[list[Matrix2x3]] = []
         self._parse()
 
     # ------------------------------------------------------------------
@@ -84,6 +137,31 @@ class SC5File:
                 u = struct.unpack("<H", bp_data[off + 8 : off + 10])[0]
                 v = struct.unpack("<H", bp_data[off + 10 : off + 12])[0]
                 self.vertices.append((x, y, u, v))
+
+        # --- Frame elements (u16 array) -----------------------------------
+        # Generated FlatBuffer code has a bug: it accesses [ushort] as [ubyte].
+        # We read the raw vector data correctly as u16 here.
+        tab = ds._tab
+        fe_field_off = tab.Offset(12)  # vtable slot for movieclips_frame_elements
+        if fe_field_off:
+            fe_vec_off = tab.Vector(fe_field_off)
+            fe_count = struct.unpack("<I", tab.Bytes[fe_vec_off - 4 : fe_vec_off])[0]
+            self._frame_elements = np.frombuffer(
+                tab.Bytes, dtype="<u2", offset=fe_vec_off, count=fe_count
+            )
+        else:
+            self._frame_elements = np.array([], dtype="<u2")
+
+        # --- Matrix banks --------------------------------------------------
+        for bi in range(ds.MatrixBanksLength()):
+            bank_fb = ds.MatrixBanks(bi)
+            matrices: list[Matrix2x3] = []
+            for mi in range(bank_fb.MatricesLength()):
+                m = bank_fb.Matrices(mi)
+                matrices.append(
+                    Matrix2x3(a=m.A(), b=m.B(), c=m.C(), d=m.D(), tx=m.Tx(), ty=m.Ty())
+                )
+            self._matrix_banks.append(matrices)
 
         # --- Chunked resources at resources_offset ------------------------
         pos = fd.ResourcesOffset()
@@ -137,23 +215,34 @@ class SC5File:
         for i in range(mc.MovieclipsLength()):
             clip = mc.Movieclips(i)
             mc_id = clip.Id()
-            children = [
-                {"id": clip.ChildrenIds(j)}
-                for j in range(clip.ChildrenIdsLength())
-            ]
-            child_names = []
+            children_ids = [clip.ChildrenIds(j) for j in range(clip.ChildrenIdsLength())]
+            children = [{"id": cid} for cid in children_ids]
+            child_names: list[str] = []
             for j in range(clip.ChildrenNameRefIdsLength()):
                 ref = clip.ChildrenNameRefIds(j)
                 if 0 < ref <= len(self.strings):
                     child_names.append(self.strings[ref - 1])
                 else:
                     child_names.append("")
+            # Frame element counts per frame
+            frame_counts: list[int] = []
+            for j in range(clip.FramesLength()):
+                frame_counts.append(clip.Frames(j).UsedTransform())
+
             self.movie_clips[mc_id] = {
                 "id": mc_id,
                 "children": children,
                 "children_names": child_names,
                 "frame_count": clip.FramesLength(),
             }
+            self.movie_clip_data[mc_id] = MovieClipData(
+                id=mc_id,
+                children_ids=children_ids,
+                children_names=child_names,
+                frame_elements_offset=clip.FrameElementsOffset(),
+                matrix_bank_index=clip.MatrixBankIndex(),
+                frame_element_counts=frame_counts,
+            )
         pos += 4 + mc_size
 
         # MovieClipModifiers (skip)
@@ -184,6 +273,41 @@ class SC5File:
                 )
 
     # ------------------------------------------------------------------
+    def _get_frame0_elements(self, mc_id: int) -> list[FrameElement]:
+        """Return frame elements for frame 0 of movie clip *mc_id*."""
+        mcd = self.movie_clip_data.get(mc_id)
+        if mcd is None or not mcd.frame_element_counts:
+            return []
+        if mcd.frame_elements_offset == 0xFFFFFFFF:
+            return []
+        fe = self._frame_elements
+        count = mcd.frame_element_counts[0]
+        result: list[FrameElement] = []
+        off = mcd.frame_elements_offset
+        for k in range(count):
+            base = off + k * 3
+            if base + 2 >= len(fe):
+                break
+            result.append(FrameElement(
+                child_index=int(fe[base]),
+                matrix_index=int(fe[base + 1]),
+                color_index=int(fe[base + 2]),
+            ))
+        return result
+
+    def _get_matrix(self, mc_id: int, matrix_index: int) -> Matrix2x3:
+        """Look up a matrix from the appropriate bank for *mc_id*."""
+        if matrix_index == _NO_TRANSFORM:
+            return Matrix2x3.IDENTITY
+        mcd = self.movie_clip_data.get(mc_id)
+        bank_idx = mcd.matrix_bank_index if mcd else 0
+        if bank_idx < len(self._matrix_banks):
+            bank = self._matrix_banks[bank_idx]
+            if matrix_index < len(bank):
+                return bank[matrix_index]
+        return Matrix2x3.IDENTITY
+
+    # ------------------------------------------------------------------
     def find_shapes_for_export(self, export_name: str) -> list[int]:
         """Return shape-list indices for every shape reachable from *export_name*."""
         mc_id = self.exports.get(export_name)
@@ -203,59 +327,117 @@ class SC5File:
         return indices
 
     # ------------------------------------------------------------------
+    def _render_shape(
+        self,
+        shape_idx: int,
+        texture_images: list[Image.Image | None],
+    ) -> tuple[Image.Image | None, float, float]:
+        """Render a single shape (all commands), return (image, x_off, y_off)."""
+        shape = self.shapes[shape_idx]
+        parts: list[tuple[Image.Image, float, float]] = []
+        for cmd in shape["commands"]:
+            tex_idx = cmd["texture_index"]
+            if tex_idx >= len(texture_images):
+                continue
+            tex_img = texture_images[tex_idx]
+            if tex_img is None:
+                continue
+            tex = self.textures[tex_idx]
+            img, x_off, y_off = render_command(
+                cmd["vertices"], tex_img, tex["width"], tex["height"]
+            )
+            if img is None or img.size[0] == 0 or img.size[1] == 0:
+                continue
+            if np.array(img)[:, :, 3].max() == 0:
+                continue
+            parts.append((img, x_off, y_off))
+        if not parts:
+            return None, 0, 0
+        if len(parts) == 1:
+            return parts[0]
+        return _composite_parts(parts)
+
+    def _render_object(
+        self,
+        obj_id: int,
+        texture_images: list[Image.Image | None],
+        parent_matrix: Matrix2x3,
+        visited: set[int],
+        depth: int = 0,
+    ) -> list[tuple[Image.Image, float, float]]:
+        """Recursively render an object (shape or movie clip) with transforms.
+
+        Returns list of (image, global_x, global_y) tuples ready for final compositing.
+        """
+        if depth > 50:
+            return []
+
+        rendered: list[tuple[Image.Image, float, float]] = []
+
+        # If it's a shape, render it and apply the parent matrix
+        shape_indices = self._shape_id_to_idx.get(obj_id, [])
+        for si in shape_indices:
+            img, x_off, y_off = self._render_shape(si, texture_images)
+            if img is None:
+                continue
+            transformed = _apply_matrix(img, x_off, y_off, parent_matrix)
+            if transformed is not None:
+                rendered.append(transformed)
+
+        # If it's a movie clip, process frame 0 elements
+        mcd = self.movie_clip_data.get(obj_id)
+        if mcd and obj_id not in visited:
+            visited.add(obj_id)
+            elements = self._get_frame0_elements(obj_id)
+
+            if elements:
+                # Use frame elements with per-child transforms
+                for elem in elements:
+                    if elem.child_index >= len(mcd.children_ids):
+                        continue
+                    child_id = mcd.children_ids[elem.child_index]
+                    child_mat = self._get_matrix(obj_id, elem.matrix_index)
+                    combined = parent_matrix @ child_mat
+                    rendered.extend(self._render_object(
+                        child_id, texture_images, combined, visited, depth + 1
+                    ))
+            else:
+                # No frame elements — fallback to identity transforms for all children
+                for child_id in mcd.children_ids:
+                    rendered.extend(self._render_object(
+                        child_id, texture_images, parent_matrix, visited, depth + 1
+                    ))
+            visited.discard(obj_id)
+
+        return rendered
+
+    # ------------------------------------------------------------------
     def extract_sprite(
         self,
         export_name: str,
         texture_images: list[Image.Image | None],
         output_path: str | Path | None = None,
     ) -> Image.Image | None:
-        """Extract a named sprite, compositing all reachable shape commands."""
-        shape_indices = self.find_shapes_for_export(export_name)
-        if not shape_indices:
+        """Extract a named sprite, compositing all shapes with correct transforms."""
+        obj_id = self.exports.get(export_name)
+        if obj_id is None:
             return None
 
-        rendered: list[tuple[Image.Image, float, float]] = []
-
-        for si in shape_indices:
-            shape = self.shapes[si]
-            for cmd in shape["commands"]:
-                tex_idx = cmd["texture_index"]
-                if tex_idx >= len(texture_images):
-                    continue
-                tex_img = texture_images[tex_idx]
-                if tex_img is None:
-                    continue
-                tex = self.textures[tex_idx]
-                img, x_off, y_off = render_command(
-                    cmd["vertices"], tex_img, tex["width"], tex["height"]
-                )
-                if img is None or img.size[0] == 0 or img.size[1] == 0:
-                    continue
-                if np.array(img)[:, :, 3].max() == 0:
-                    continue
-                rendered.append((img, x_off, y_off))
+        rendered = self._render_object(
+            obj_id, texture_images, Matrix2x3.IDENTITY, set()
+        )
 
         if not rendered:
             return None
 
-        all_x_min = min(xo for _, xo, _ in rendered)
-        all_y_min = min(yo for _, _, yo in rendered)
-        all_x_max = max(xo + img.width for img, xo, _ in rendered)
-        all_y_max = max(yo + img.height for _, _, yo in rendered)
-
-        out_w = int(all_x_max - all_x_min + 0.5)
-        out_h = int(all_y_max - all_y_min + 0.5)
-        if out_w <= 0 or out_h <= 0 or out_w > 4096 or out_h > 4096:
+        result = _composite_parts(rendered)
+        if result is None:
             return None
 
-        result = Image.new("RGBA", (out_w, out_h), (0, 0, 0, 0))
-        for img, xo, yo in rendered:
-            result.alpha_composite(img, (int(xo - all_x_min), int(yo - all_y_min)))
-
+        img, _, _ = result
         if output_path:
-            result.save(str(output_path))
-
-        return result
+            img.save(str(output_path))
+        return img
 
     # ------------------------------------------------------------------
     def get_shape_bounds(self, shape_idx: int) -> dict[str, Any] | None:
@@ -284,3 +466,105 @@ class SC5File:
             "width": max(all_us) - min(all_us),
             "height": max(all_vs) - min(all_vs),
         }
+
+
+# ======================================================================
+# Helpers
+# ======================================================================
+
+def _apply_matrix(
+    img: Image.Image,
+    x_off: float,
+    y_off: float,
+    mat: Matrix2x3,
+) -> tuple[Image.Image, float, float] | None:
+    """Apply an affine matrix to a rendered sprite fragment.
+
+    Takes the fragment at local position (x_off, y_off) and transforms it.
+    Returns (transformed_image, new_x, new_y) in the parent coordinate space.
+    """
+    if mat.a == 1 and mat.b == 0 and mat.c == 0 and mat.d == 1:
+        # Pure translation — skip expensive affine transform
+        return img, x_off + mat.tx, y_off + mat.ty
+
+    w, h = img.size
+
+    # Transform the four corners to find the output bounding box
+    corners = [
+        (x_off, y_off),
+        (x_off + w, y_off),
+        (x_off, y_off + h),
+        (x_off + w, y_off + h),
+    ]
+    txs = [mat.a * cx + mat.b * cy + mat.tx for cx, cy in corners]
+    tys = [mat.c * cx + mat.d * cy + mat.ty for cx, cy in corners]
+
+    out_x_min = min(txs)
+    out_y_min = min(tys)
+    out_x_max = max(txs)
+    out_y_max = max(tys)
+
+    out_w = max(1, int(out_x_max - out_x_min + 1.5))
+    out_h = max(1, int(out_y_max - out_y_min + 1.5))
+
+    if out_w > 4096 or out_h > 4096:
+        return None
+
+    # PIL affine transform uses the INVERSE matrix:
+    # for each output pixel (ox, oy), find input pixel (ix, iy)
+    # We need: (ix - x_off, iy - y_off) in the source image
+    # where (ix, iy) = inv(mat) @ (ox + out_x_min, oy + out_y_min)
+    det = mat.a * mat.d - mat.b * mat.c
+    if abs(det) < 1e-10:
+        return None
+    inv_a = mat.d / det
+    inv_b = -mat.b / det
+    inv_c = -mat.c / det
+    inv_d = mat.a / det
+    inv_tx = (mat.b * mat.ty - mat.d * mat.tx) / det
+    inv_ty = (mat.c * mat.tx - mat.a * mat.ty) / det
+
+    # PIL transform coefficients map output (ox, oy) → input (ix, iy):
+    # ix = a*ox + b*oy + c
+    # iy = d*ox + e*oy + f
+    # We need to account for the output offset (out_x_min, out_y_min) and
+    # the source image offset (x_off, y_off).
+    coeffs = (
+        inv_a,
+        inv_b,
+        inv_a * out_x_min + inv_b * out_y_min + inv_tx - x_off,
+        inv_c,
+        inv_d,
+        inv_c * out_x_min + inv_d * out_y_min + inv_ty - y_off,
+    )
+
+    result = img.transform(
+        (out_w, out_h), Image.AFFINE, coeffs, Image.BILINEAR
+    )
+    return result, out_x_min, out_y_min
+
+
+def _composite_parts(
+    parts: list[tuple[Image.Image, float, float]],
+) -> tuple[Image.Image, float, float] | None:
+    """Alpha-composite multiple (image, x, y) fragments into one image."""
+    if not parts:
+        return None
+
+    all_x_min = min(xo for _, xo, _ in parts)
+    all_y_min = min(yo for _, _, yo in parts)
+    all_x_max = max(xo + im.width for im, xo, _ in parts)
+    all_y_max = max(yo + im.height for im, _, yo in parts)
+
+    out_w = int(all_x_max - all_x_min + 0.5)
+    out_h = int(all_y_max - all_y_min + 0.5)
+    if out_w <= 0 or out_h <= 0 or out_w > 8192 or out_h > 8192:
+        return None
+
+    result = Image.new("RGBA", (out_w, out_h), (0, 0, 0, 0))
+    for img, xo, yo in parts:
+        px = int(xo - all_x_min)
+        py = int(yo - all_y_min)
+        result.alpha_composite(img, (px, py))
+
+    return result, all_x_min, all_y_min
