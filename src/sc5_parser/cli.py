@@ -36,6 +36,12 @@ def main(argv: list[str] | None = None) -> None:
         help="Export names to extract (omit for all)",
     )
     ap.add_argument(
+        "--frame-label",
+        metavar="LABEL",
+        help="Frame label to select for child MCs "
+        "(e.g. evo_unlocked, hero_unlocked)",
+    )
+    ap.add_argument(
         "--info", action="store_true", help="Show file structure summary"
     )
 
@@ -102,7 +108,10 @@ def _extract(sc: SC5File, args: argparse.Namespace) -> None:
     extracted = 0
     for name in names:
         out_path = os.path.join(output_dir, f"{name}.png")
-        result = sc.extract_sprite(name, texture_images, out_path)
+        result = sc.extract_sprite(
+            name, texture_images, out_path,
+            frame_label=args.frame_label,
+        )
         if result:
             print(f"  Extracted: {name} ({result.width}×{result.height})")
             extracted += 1

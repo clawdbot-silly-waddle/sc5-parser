@@ -58,6 +58,39 @@ Matrix2x3.IDENTITY = Matrix2x3()
 
 
 @dataclass
+class ColorTransform:
+    """RGBA color transform: new = old * mul/255 + add."""
+    r_mul: int = 255
+    g_mul: int = 255
+    b_mul: int = 255
+    alpha: int = 255
+    r_add: int = 0
+    g_add: int = 0
+    b_add: int = 0
+
+    IDENTITY: ColorTransform = None  # type: ignore[assignment]
+
+    def apply(self, img: Image.Image) -> Image.Image:
+        """Apply this color transform to an RGBA image."""
+        if self is ColorTransform.IDENTITY:
+            return img
+        if (self.r_mul == 255 and self.g_mul == 255 and self.b_mul == 255
+                and self.alpha == 255
+                and self.r_add == 0 and self.g_add == 0 and self.b_add == 0):
+            return img
+        arr = np.array(img, dtype=np.int16)
+        r, g, b, a = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2], arr[:, :, 3]
+        arr[:, :, 0] = np.clip(r * self.r_mul // 255 + self.r_add, 0, 255)
+        arr[:, :, 1] = np.clip(g * self.g_mul // 255 + self.g_add, 0, 255)
+        arr[:, :, 2] = np.clip(b * self.b_mul // 255 + self.b_add, 0, 255)
+        arr[:, :, 3] = np.clip(a * self.alpha // 255, 0, 255)
+        return Image.fromarray(arr.astype(np.uint8), "RGBA")
+
+
+ColorTransform.IDENTITY = ColorTransform()
+
+
+@dataclass
 class FrameElement:
     """One visible child in a MovieClip frame."""
     child_index: int
@@ -74,6 +107,7 @@ class MovieClipData:
     frame_elements_offset: int = 0xFFFFFFFF
     matrix_bank_index: int = 0
     frame_element_counts: list[int] = field(default_factory=list)
+    frame_labels: list[str] = field(default_factory=list)
 
 
 class SC5File:
@@ -91,6 +125,7 @@ class SC5File:
         self._shape_id_to_idx: dict[int, list[int]] = {}
         self._frame_elements: np.ndarray | None = None
         self._matrix_banks: list[list[Matrix2x3]] = []
+        self._color_banks: list[list[ColorTransform]] = []
         self._parse()
 
     # ------------------------------------------------------------------
@@ -162,6 +197,15 @@ class SC5File:
                     Matrix2x3(a=m.A(), b=m.B(), c=m.C(), d=m.D(), tx=m.Tx(), ty=m.Ty())
                 )
             self._matrix_banks.append(matrices)
+            colors: list[ColorTransform] = []
+            for ci in range(bank_fb.ColorsLength()):
+                c = bank_fb.Colors(ci)
+                colors.append(ColorTransform(
+                    r_mul=c.RMul(), g_mul=c.GMul(), b_mul=c.BMul(),
+                    alpha=c.Alpha(),
+                    r_add=c.RAdd(), g_add=c.GAdd(), b_add=c.BAdd(),
+                ))
+            self._color_banks.append(colors)
 
         # --- Chunked resources at resources_offset ------------------------
         pos = fd.ResourcesOffset()
@@ -224,10 +268,15 @@ class SC5File:
                     child_names.append(self.strings[ref - 1])
                 else:
                     child_names.append("")
-            # Frame element counts per frame
+            # Frame element counts and labels per frame
             frame_counts: list[int] = []
+            frame_labels: list[str] = []
             for j in range(clip.FramesLength()):
-                frame_counts.append(clip.Frames(j).UsedTransform())
+                frame = clip.Frames(j)
+                frame_counts.append(frame.UsedTransform())
+                lid = frame.LabelRefId()
+                label = self.strings[lid - 1] if 0 < lid <= len(self.strings) else ""
+                frame_labels.append(label)
 
             self.movie_clips[mc_id] = {
                 "id": mc_id,
@@ -242,6 +291,7 @@ class SC5File:
                 frame_elements_offset=clip.FrameElementsOffset(),
                 matrix_bank_index=clip.MatrixBankIndex(),
                 frame_element_counts=frame_counts,
+                frame_labels=frame_labels,
             )
         pos += 4 + mc_size
 
@@ -273,17 +323,22 @@ class SC5File:
                 )
 
     # ------------------------------------------------------------------
-    def _get_frame0_elements(self, mc_id: int) -> list[FrameElement]:
-        """Return frame elements for frame 0 of movie clip *mc_id*."""
+    def _get_frame_elements(self, mc_id: int, frame_idx: int = 0) -> list[FrameElement]:
+        """Return frame elements for frame *frame_idx* of movie clip *mc_id*."""
         mcd = self.movie_clip_data.get(mc_id)
         if mcd is None or not mcd.frame_element_counts:
             return []
         if mcd.frame_elements_offset == 0xFFFFFFFF:
             return []
+        if frame_idx < 0 or frame_idx >= len(mcd.frame_element_counts):
+            return []
         fe = self._frame_elements
-        count = mcd.frame_element_counts[0]
-        result: list[FrameElement] = []
+        # Advance past preceding frames' elements
         off = mcd.frame_elements_offset
+        for fi in range(frame_idx):
+            off += mcd.frame_element_counts[fi] * 3
+        count = mcd.frame_element_counts[frame_idx]
+        result: list[FrameElement] = []
         for k in range(count):
             base = off + k * 3
             if base + 2 >= len(fe):
@@ -294,6 +349,16 @@ class SC5File:
                 color_index=int(fe[base + 2]),
             ))
         return result
+
+    def _find_frame_by_label(self, mc_id: int, label: str) -> int:
+        """Find frame index by label name, returning 0 if not found."""
+        mcd = self.movie_clip_data.get(mc_id)
+        if mcd is None:
+            return 0
+        for i, fl in enumerate(mcd.frame_labels):
+            if fl == label:
+                return i
+        return 0
 
     def _get_matrix(self, mc_id: int, matrix_index: int) -> Matrix2x3:
         """Look up a matrix from the appropriate bank for *mc_id*."""
@@ -306,6 +371,18 @@ class SC5File:
             if matrix_index < len(bank):
                 return bank[matrix_index]
         return Matrix2x3.IDENTITY
+
+    def _get_color(self, mc_id: int, color_index: int) -> ColorTransform:
+        """Look up a color transform from the appropriate bank for *mc_id*."""
+        if color_index == _NO_TRANSFORM:
+            return ColorTransform.IDENTITY
+        mcd = self.movie_clip_data.get(mc_id)
+        bank_idx = mcd.matrix_bank_index if mcd else 0
+        if bank_idx < len(self._color_banks):
+            bank = self._color_banks[bank_idx]
+            if color_index < len(bank):
+                return bank[color_index]
+        return ColorTransform.IDENTITY
 
     # ------------------------------------------------------------------
     def find_shapes_for_export(self, export_name: str) -> list[int]:
@@ -363,9 +440,14 @@ class SC5File:
         texture_images: list[Image.Image | None],
         parent_matrix: Matrix2x3,
         visited: set[int],
+        color: ColorTransform | None = None,
+        frame_label: str | None = None,
         depth: int = 0,
     ) -> list[tuple[Image.Image, float, float]]:
         """Recursively render an object (shape or movie clip) with transforms.
+
+        *frame_label*: if set, child MCs that have a frame with this label
+        will render that frame instead of frame 0.
 
         Returns list of (image, global_x, global_y) tuples ready for final compositing.
         """
@@ -380,33 +462,45 @@ class SC5File:
             img, x_off, y_off = self._render_shape(si, texture_images)
             if img is None:
                 continue
+            if color is not None:
+                img = color.apply(img)
             transformed = _apply_matrix(img, x_off, y_off, parent_matrix)
             if transformed is not None:
                 rendered.append(transformed)
 
-        # If it's a movie clip, process frame 0 elements
+        # If it's a movie clip, process frame elements
         mcd = self.movie_clip_data.get(obj_id)
         if mcd and obj_id not in visited:
             visited.add(obj_id)
-            elements = self._get_frame0_elements(obj_id)
+
+            # Pick frame: prefer label match, fall back to 0
+            frame_idx = 0
+            if frame_label:
+                frame_idx = self._find_frame_by_label(obj_id, frame_label)
+
+            elements = self._get_frame_elements(obj_id, frame_idx)
 
             if elements:
-                # Use frame elements with per-child transforms
                 for elem in elements:
                     if elem.child_index >= len(mcd.children_ids):
                         continue
                     child_id = mcd.children_ids[elem.child_index]
                     child_mat = self._get_matrix(obj_id, elem.matrix_index)
+                    child_color = self._get_color(obj_id, elem.color_index)
                     combined = parent_matrix @ child_mat
                     rendered.extend(self._render_object(
-                        child_id, texture_images, combined, visited, depth + 1
+                        child_id, texture_images, combined, visited,
+                        child_color if child_color is not ColorTransform.IDENTITY else color,
+                        frame_label, depth + 1,
                     ))
-            else:
-                # No frame elements — fallback to identity transforms for all children
+            elif mcd.frame_elements_offset == 0xFFFFFFFF:
+                # No frame element data at all — render children with identity
                 for child_id in mcd.children_ids:
                     rendered.extend(self._render_object(
-                        child_id, texture_images, parent_matrix, visited, depth + 1
+                        child_id, texture_images, parent_matrix, visited,
+                        color, frame_label, depth + 1,
                     ))
+            # else: selected frame explicitly has 0 elements — nothing visible
             visited.discard(obj_id)
 
         return rendered
@@ -417,14 +511,20 @@ class SC5File:
         export_name: str,
         texture_images: list[Image.Image | None],
         output_path: str | Path | None = None,
+        frame_label: str | None = None,
     ) -> Image.Image | None:
-        """Extract a named sprite, compositing all shapes with correct transforms."""
+        """Extract a named sprite, compositing all shapes with correct transforms.
+
+        *frame_label*: if set, child MCs select the frame matching this label
+        (e.g. "evo_unlocked") instead of frame 0.
+        """
         obj_id = self.exports.get(export_name)
         if obj_id is None:
             return None
 
         rendered = self._render_object(
-            obj_id, texture_images, Matrix2x3.IDENTITY, set()
+            obj_id, texture_images, Matrix2x3.IDENTITY, set(),
+            frame_label=frame_label,
         )
 
         if not rendered:
