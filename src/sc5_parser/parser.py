@@ -19,6 +19,7 @@ from PIL import Image
 from sc5_parser._schemas.sc.flash.SC2.DataStorage import DataStorage
 from sc5_parser._schemas.sc.flash.SC2.ExportNames import ExportNames
 from sc5_parser._schemas.sc.flash.SC2.FileDescriptor import FileDescriptor
+from sc5_parser._schemas.sc.flash.SC2.MovieClipModifiers import MovieClipModifiers
 from sc5_parser._schemas.sc.flash.SC2.MovieClips import MovieClips
 from sc5_parser._schemas.sc.flash.SC2.Shapes import Shapes
 from sc5_parser._schemas.sc.flash.SC2.Textures import Textures
@@ -28,6 +29,11 @@ ShapeDict = dict[str, Any]
 
 # Sentinel: "no matrix" / "no color transform" in frame elements
 _NO_TRANSFORM = 0xFFFF
+
+# MovieClipModifier types
+_MOD_MASK = 38      # Defines the start of a mask group; next child is the mask shape
+_MOD_MASKED = 39    # Children after this are clipped by the mask
+_MOD_UNMASKED = 40  # End of masked group; children render normally
 
 
 @dataclass
@@ -121,6 +127,7 @@ class SC5File:
         self.textures: list[dict[str, Any]] = []
         self.movie_clips: dict[int, dict[str, Any]] = {}
         self.movie_clip_data: dict[int, MovieClipData] = {}
+        self.modifiers: dict[int, int] = {}  # id → modifier type (38/39/40)
         self.strings: list[str] = []
         self.vertices: list[tuple[float, float, int, int]] = []
         self._shape_id_to_idx: dict[int, list[int]] = {}
@@ -298,8 +305,15 @@ class SC5File:
             )
         pos += 4 + mc_size
 
-        # MovieClipModifiers (skip)
+        # MovieClipModifiers
         mod_size = struct.unpack("<I", inner[pos : pos + 4])[0]
+        if mod_size > 0:
+            mods = MovieClipModifiers.GetRootAs(
+                bytes(inner[pos + 4 : pos + 4 + mod_size]), 0
+            )
+            for i in range(mods.ModifiersLength()):
+                m = mods.Modifiers(i)
+                self.modifiers[m.Id()] = m.Type()
         pos += 4 + mod_size
 
         # Textures
@@ -488,25 +502,69 @@ class SC5File:
             elements = self._get_frame_elements(obj_id, frame_idx)
 
             if elements:
+                # Mask state machine for MovieClipModifiers
+                mask_img: Image.Image | None = None
+                mask_x: float = 0
+                mask_y: float = 0
+                capture_mask = False  # next rendered child becomes the mask
+                apply_mask = False    # clip children to mask
+
                 for elem in elements:
                     if elem.child_index >= len(mcd.children_ids):
                         continue
                     child_id = mcd.children_ids[elem.child_index]
+
+                    # Check if child is a modifier
+                    mod_type = self.modifiers.get(child_id)
+                    if mod_type == _MOD_MASK:
+                        capture_mask = True
+                        continue
+                    elif mod_type == _MOD_MASKED:
+                        apply_mask = True
+                        continue
+                    elif mod_type == _MOD_UNMASKED:
+                        apply_mask = False
+                        mask_img = None
+                        continue
+
                     child_mat = self._get_matrix(obj_id, elem.matrix_index)
                     child_color = self._get_color(obj_id, elem.color_index)
                     combined = parent_matrix @ child_mat
-                    # Blend mode comes from the child's position in children_blending
                     child_blend = (
                         mcd.children_blending[elem.child_index]
                         if elem.child_index < len(mcd.children_blending)
                         else 0
                     )
-                    rendered.extend(self._render_object(
+
+                    child_parts = self._render_object(
                         child_id, texture_images, combined, visited,
                         child_color if child_color is not ColorTransform.IDENTITY else color,
                         frame_label, depth + 1,
                         blend_mode=child_blend,
-                    ))
+                    )
+
+                    if capture_mask:
+                        # Composite this child into a single mask image
+                        capture_mask = False
+                        if child_parts:
+                            mask_result = _composite_parts(
+                                [(im, x, y, 0) for im, x, y, _ in child_parts]
+                            )
+                            if mask_result:
+                                mask_img, mask_x, mask_y = mask_result
+                        continue  # mask shape itself is not drawn
+
+                    if apply_mask and mask_img is not None and child_parts:
+                        # Clip each fragment to the mask alpha
+                        for cp_img, cp_x, cp_y, cp_blend in child_parts:
+                            clipped = _clip_to_mask(
+                                cp_img, cp_x, cp_y, mask_img, mask_x, mask_y
+                            )
+                            if clipped is not None:
+                                c_img, c_x, c_y = clipped
+                                rendered.append((c_img, c_x, c_y, cp_blend))
+                    else:
+                        rendered.extend(child_parts)
             elif mcd.frame_elements_offset == 0xFFFFFFFF:
                 # No frame element data at all — render children with identity
                 for idx, child_id in enumerate(mcd.children_ids):
@@ -591,6 +649,44 @@ class SC5File:
 # ======================================================================
 # Helpers
 # ======================================================================
+
+def _clip_to_mask(
+    img: Image.Image,
+    img_x: float,
+    img_y: float,
+    mask: Image.Image,
+    mask_x: float,
+    mask_y: float,
+) -> tuple[Image.Image, float, float] | None:
+    """Clip *img* to the alpha channel of *mask*, both in global coordinates."""
+    # Find overlap region
+    ix1, iy1 = int(img_x), int(img_y)
+    ix2, iy2 = ix1 + img.width, iy1 + img.height
+    mx1, my1 = int(mask_x), int(mask_y)
+    mx2, my2 = mx1 + mask.width, my1 + mask.height
+
+    ox1 = max(ix1, mx1)
+    oy1 = max(iy1, my1)
+    ox2 = min(ix2, mx2)
+    oy2 = min(iy2, my2)
+
+    if ox1 >= ox2 or oy1 >= oy2:
+        return None
+
+    # Crop both to the overlap region
+    img_crop = img.crop((ox1 - ix1, oy1 - iy1, ox2 - ix1, oy2 - iy1))
+    mask_crop = mask.crop((ox1 - mx1, oy1 - my1, ox2 - mx1, oy2 - my1))
+
+    # Multiply img alpha by mask alpha
+    img_arr = np.array(img_crop).copy()
+    mask_alpha = np.array(mask_crop)[:, :, 3].astype(np.uint16)
+    img_arr[:, :, 3] = (img_arr[:, :, 3].astype(np.uint16) * mask_alpha // 255).astype(np.uint8)
+
+    if img_arr[:, :, 3].max() == 0:
+        return None
+
+    return Image.fromarray(img_arr), float(ox1), float(oy1)
+
 
 def _apply_matrix(
     img: Image.Image,
