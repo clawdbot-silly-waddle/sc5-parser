@@ -104,6 +104,7 @@ class MovieClipData:
     id: int
     children_ids: list[int] = field(default_factory=list)
     children_names: list[str] = field(default_factory=list)
+    children_blending: list[int] = field(default_factory=list)
     frame_elements_offset: int = 0xFFFFFFFF
     matrix_bank_index: int = 0
     frame_element_counts: list[int] = field(default_factory=list)
@@ -284,10 +285,12 @@ class SC5File:
                 "children_names": child_names,
                 "frame_count": clip.FramesLength(),
             }
+            children_blending = [clip.ChildrenBlending(j) for j in range(clip.ChildrenBlendingLength())]
             self.movie_clip_data[mc_id] = MovieClipData(
                 id=mc_id,
                 children_ids=children_ids,
                 children_names=child_names,
+                children_blending=children_blending,
                 frame_elements_offset=clip.FrameElementsOffset(),
                 matrix_bank_index=clip.MatrixBankIndex(),
                 frame_element_counts=frame_counts,
@@ -411,7 +414,7 @@ class SC5File:
     ) -> tuple[Image.Image | None, float, float]:
         """Render a single shape (all commands), return (image, x_off, y_off)."""
         shape = self.shapes[shape_idx]
-        parts: list[tuple[Image.Image, float, float]] = []
+        parts: list[tuple[Image.Image, float, float, int]] = []
         for cmd in shape["commands"]:
             tex_idx = cmd["texture_index"]
             if tex_idx >= len(texture_images):
@@ -427,11 +430,12 @@ class SC5File:
                 continue
             if np.array(img)[:, :, 3].max() == 0:
                 continue
-            parts.append((img, x_off, y_off))
+            parts.append((img, x_off, y_off, 0))
         if not parts:
             return None, 0, 0
         if len(parts) == 1:
-            return parts[0]
+            img, x, y, _ = parts[0]
+            return img, x, y
         return _composite_parts(parts)
 
     def _render_object(
@@ -443,18 +447,20 @@ class SC5File:
         color: ColorTransform | None = None,
         frame_label: str | None = None,
         depth: int = 0,
-    ) -> list[tuple[Image.Image, float, float]]:
+        blend_mode: int = 0,
+    ) -> list[tuple[Image.Image, float, float, int]]:
         """Recursively render an object (shape or movie clip) with transforms.
 
         *frame_label*: if set, child MCs that have a frame with this label
         will render that frame instead of frame 0.
+        *blend_mode*: 0=normal, 8=add (additive blending).
 
-        Returns list of (image, global_x, global_y) tuples ready for final compositing.
+        Returns list of (image, global_x, global_y, blend_mode) tuples ready for final compositing.
         """
         if depth > 50:
             return []
 
-        rendered: list[tuple[Image.Image, float, float]] = []
+        rendered: list[tuple[Image.Image, float, float, int]] = []
 
         # If it's a shape, render it and apply the parent matrix
         shape_indices = self._shape_id_to_idx.get(obj_id, [])
@@ -466,7 +472,8 @@ class SC5File:
                 img = color.apply(img)
             transformed = _apply_matrix(img, x_off, y_off, parent_matrix)
             if transformed is not None:
-                rendered.append(transformed)
+                t_img, t_x, t_y = transformed
+                rendered.append((t_img, t_x, t_y, blend_mode))
 
         # If it's a movie clip, process frame elements
         mcd = self.movie_clip_data.get(obj_id)
@@ -488,17 +495,30 @@ class SC5File:
                     child_mat = self._get_matrix(obj_id, elem.matrix_index)
                     child_color = self._get_color(obj_id, elem.color_index)
                     combined = parent_matrix @ child_mat
+                    # Blend mode comes from the child's position in children_blending
+                    child_blend = (
+                        mcd.children_blending[elem.child_index]
+                        if elem.child_index < len(mcd.children_blending)
+                        else 0
+                    )
                     rendered.extend(self._render_object(
                         child_id, texture_images, combined, visited,
                         child_color if child_color is not ColorTransform.IDENTITY else color,
                         frame_label, depth + 1,
+                        blend_mode=child_blend,
                     ))
             elif mcd.frame_elements_offset == 0xFFFFFFFF:
                 # No frame element data at all — render children with identity
-                for child_id in mcd.children_ids:
+                for idx, child_id in enumerate(mcd.children_ids):
+                    child_blend = (
+                        mcd.children_blending[idx]
+                        if idx < len(mcd.children_blending)
+                        else 0
+                    )
                     rendered.extend(self._render_object(
                         child_id, texture_images, parent_matrix, visited,
                         color, frame_label, depth + 1,
+                        blend_mode=child_blend,
                     ))
             # else: selected frame explicitly has 0 elements — nothing visible
             visited.discard(obj_id)
@@ -645,16 +665,19 @@ def _apply_matrix(
 
 
 def _composite_parts(
-    parts: list[tuple[Image.Image, float, float]],
+    parts: list[tuple[Image.Image, float, float, int]],
 ) -> tuple[Image.Image, float, float] | None:
-    """Alpha-composite multiple (image, x, y) fragments into one image."""
+    """Composite multiple (image, x, y, blend_mode) fragments into one image.
+
+    Blend modes: 0=normal (alpha composite), 8=add (additive).
+    """
     if not parts:
         return None
 
-    all_x_min = min(xo for _, xo, _ in parts)
-    all_y_min = min(yo for _, _, yo in parts)
-    all_x_max = max(xo + im.width for im, xo, _ in parts)
-    all_y_max = max(yo + im.height for im, _, yo in parts)
+    all_x_min = min(xo for _, xo, _, _ in parts)
+    all_y_min = min(yo for _, _, yo, _ in parts)
+    all_x_max = max(xo + im.width for im, xo, _, _ in parts)
+    all_y_max = max(yo + im.height for im, _, yo, _ in parts)
 
     out_w = int(all_x_max - all_x_min + 0.5)
     out_h = int(all_y_max - all_y_min + 0.5)
@@ -662,9 +685,49 @@ def _composite_parts(
         return None
 
     result = Image.new("RGBA", (out_w, out_h), (0, 0, 0, 0))
-    for img, xo, yo in parts:
+    for img, xo, yo, blend in parts:
         px = int(xo - all_x_min)
         py = int(yo - all_y_min)
-        result.alpha_composite(img, (px, py))
+        if blend == 8:
+            # Additive blend: add RGB weighted by overlay alpha, keep base alpha
+            _additive_blend(result, img, px, py)
+        else:
+            result.alpha_composite(img, (px, py))
 
     return result, all_x_min, all_y_min
+
+
+def _additive_blend(
+    base: Image.Image,
+    overlay: Image.Image,
+    px: int,
+    py: int,
+) -> None:
+    """In-place additive blend of overlay onto base at (px, py).
+
+    For each pixel: base_rgb += overlay_rgb * overlay_alpha / 255,
+    base_alpha = max(base_alpha, overlay_alpha).
+    """
+    ow, oh = overlay.size
+    bw, bh = base.size
+    # Clip to base bounds
+    x1, y1 = max(px, 0), max(py, 0)
+    x2, y2 = min(px + ow, bw), min(py + oh, bh)
+    if x1 >= x2 or y1 >= y2:
+        return
+
+    base_arr = np.array(base)
+    over_arr = np.array(overlay)
+
+    # Slices in base and overlay coordinate systems
+    bslice = base_arr[y1:y2, x1:x2].astype(np.uint16)
+    oslice = over_arr[y1 - py : y2 - py, x1 - px : x2 - px].astype(np.uint16)
+
+    alpha = oslice[:, :, 3:4]  # (h, w, 1) broadcast
+    # Add RGB weighted by overlay alpha
+    bslice[:, :, :3] = np.minimum(bslice[:, :, :3] + oslice[:, :, :3] * alpha // 255, 255)
+    # Alpha: take max
+    bslice[:, :, 3] = np.maximum(bslice[:, :, 3], oslice[:, :, 3])
+
+    base_arr[y1:y2, x1:x2] = bslice.astype(np.uint8)
+    base.paste(Image.fromarray(base_arr))
