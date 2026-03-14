@@ -193,8 +193,8 @@ def render_champion_card(
 
     *render_scale*: multiplier for the output resolution.  At 1.0 shapes
     are rasterised at native SC coordinates (~130 px wide); higher values
-    produce proportionally larger output via ``_apply_matrix`` BILINEAR
-    resampling, avoiding nearest-neighbour pixelation.
+    produce proportionally larger output with texture sampling at the
+    target density, avoiding nearest-neighbour pixelation.
 
     Returns a composited RGBA image or ``None`` on failure.
     """

@@ -30,6 +30,7 @@ def render_command(
     tex_img: Image.Image,
     tex_w: int,
     tex_h: int,
+    transform: tuple[float, float, float, float, float, float] | None = None,
 ) -> tuple[Image.Image | None, float, float]:
     """Rasterise a shape command to an RGBA image.
 
@@ -37,23 +38,38 @@ def render_command(
     ----------
     cmd_verts:
         List of ``(x, y, u_raw, v_raw)`` tuples.  *u_raw*/*v_raw* are
-        normalised 0–65535 and mapped to pixel coordinates internally.
+        normalised 0--65535 and mapped to pixel coordinates internally.
     tex_img:
         Decoded RGBA texture atlas.
     tex_w, tex_h:
         Texture dimensions in pixels.
+    transform:
+        Optional ``(a, b, c, d, tx, ty)`` affine coefficients applied to
+        vertex XY before rasterisation.  When provided, output coordinates
+        are in the transformed space and the texture is sampled at higher
+        density (no post-rasterisation upscale needed).
 
     Returns
     -------
     ``(image, x_offset, y_offset)`` - the rendered sprite fragment and
-    its position relative to the shape's local origin.  Returns
-    ``(None, 0, 0)`` when rendering is impossible.
+    its position relative to the shape's local origin (or the transformed
+    origin when *transform* is supplied).  Returns ``(None, 0, 0)`` when
+    rendering is impossible.
     """
     if len(cmd_verts) < 3:
         return None, 0, 0
 
-    xs = [v[0] for v in cmd_verts]
-    ys = [v[1] for v in cmd_verts]
+    if transform is not None:
+        ta, tb, tc, td, ttx, tty = transform
+        verts = [
+            (ta * x + tb * y + ttx, tc * x + td * y + tty, u, v)
+            for x, y, u, v in cmd_verts
+        ]
+    else:
+        verts = cmd_verts
+
+    xs = [v[0] for v in verts]
+    ys = [v[1] for v in verts]
     x_min, x_max = min(xs), max(xs)
     y_min, y_max = min(ys), max(ys)
 
@@ -70,10 +86,10 @@ def render_command(
     # (from an adjacent triangle's edge) must not overwrite these.
     filled = np.zeros((out_h, out_w), dtype=np.bool_)
 
-    for i0, i1, i2 in triangulate_strip(len(cmd_verts)):
-        x0, y0, u0_raw, v0_raw = cmd_verts[i0]
-        x1, y1, u1_raw, v1_raw = cmd_verts[i1]
-        x2, y2, u2_raw, v2_raw = cmd_verts[i2]
+    for i0, i1, i2 in triangulate_strip(len(verts)):
+        x0, y0, u0_raw, v0_raw = verts[i0]
+        x1, y1, u1_raw, v1_raw = verts[i1]
+        x2, y2, u2_raw, v2_raw = verts[i2]
 
         tu0 = u0_raw / 65535.0 * tex_w
         tv0 = v0_raw / 65535.0 * tex_h
@@ -92,6 +108,16 @@ def render_command(
         denom = (oy1 - oy2) * (ox0 - ox2) + (ox2 - ox1) * (oy0 - oy2)
         if abs(denom) < 1e-6:
             continue
+
+        # A transform with negative determinant (mirror/flip) reverses
+        # triangle winding.  Swap v1↔v2 to restore positive winding so
+        # barycentric interpolation produces correct signs.
+        if denom < 0:
+            ox1, oy1, tu1, tv1, ox2, oy2, tu2, tv2 = (
+                ox2, oy2, tu2, tv2, ox1, oy1, tu1, tv1
+            )
+            denom = -denom
+
         inv_denom = 1.0 / denom
 
         tri_y_min = max(0, int(min(oy0, oy1, oy2)))

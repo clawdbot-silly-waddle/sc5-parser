@@ -456,8 +456,14 @@ class SC5File:
         self,
         shape_idx: int,
         texture_images: list[Image.Image | None],
+        transform: tuple[float, float, float, float, float, float] | None = None,
     ) -> tuple[Image.Image | None, float, float]:
-        """Render a single shape (all commands), return (image, x_off, y_off)."""
+        """Render a single shape (all commands), return (image, x_off, y_off).
+
+        When *transform* is given, vertex XY are transformed before
+        rasterisation so the output is in the transformed coordinate
+        space at full resolution.
+        """
         shape = self.shapes[shape_idx]
         parts: list[tuple[Image.Image, float, float, int]] = []
         for cmd in shape["commands"]:
@@ -469,7 +475,8 @@ class SC5File:
                 continue
             tex = self.textures[tex_idx]
             img, x_off, y_off = render_command(
-                cmd["vertices"], tex_img, tex["width"], tex["height"]
+                cmd["vertices"], tex_img, tex["width"], tex["height"],
+                transform=transform,
             )
             if img is None or img.size[0] == 0 or img.size[1] == 0:
                 continue
@@ -519,18 +526,34 @@ class SC5File:
 
         rendered: list[tuple[Image.Image, float, float, int]] = []
 
-        # If it's a shape, render it and apply the parent matrix
+        # If it's a shape, render it with the parent matrix baked into
+        # vertex coordinates so the texture is sampled at full target
+        # resolution (no lossy post-rasterisation upscale).
+        # Pure translations skip the transform (just offset the result).
         shape_indices = self._shape_id_to_idx.get(obj_id, [])
+        _pure_xlate = (
+            parent_matrix.a == 1 and parent_matrix.b == 0
+            and parent_matrix.c == 0 and parent_matrix.d == 1
+        )
+        mat_tuple: tuple[float, float, float, float, float, float] | None = None
+        if shape_indices and not _pure_xlate and parent_matrix != Matrix2x3.IDENTITY:
+            mat_tuple = (
+                parent_matrix.a, parent_matrix.b,
+                parent_matrix.c, parent_matrix.d,
+                parent_matrix.tx, parent_matrix.ty,
+            )
         for si in shape_indices:
-            img, x_off, y_off = self._render_shape(si, texture_images)
+            img, x_off, y_off = self._render_shape(
+                si, texture_images, transform=mat_tuple,
+            )
             if img is None:
                 continue
             if color is not None:
                 img = color.apply(img)
-            transformed = _apply_matrix(img, x_off, y_off, parent_matrix)
-            if transformed is not None:
-                t_img, t_x, t_y = transformed
-                rendered.append((t_img, t_x, t_y, blend_mode))
+            if _pure_xlate:
+                x_off += parent_matrix.tx
+                y_off += parent_matrix.ty
+            rendered.append((img, x_off, y_off, blend_mode))
 
         # If it's a movie clip, process frame elements
         mcd = self.movie_clip_data.get(obj_id)
@@ -874,78 +897,6 @@ def clip_to_mask(
         return None
 
     return Image.fromarray(img_arr), float(ox1), float(oy1)
-
-
-def _apply_matrix(
-    img: Image.Image,
-    x_off: float,
-    y_off: float,
-    mat: Matrix2x3,
-) -> tuple[Image.Image, float, float] | None:
-    """Apply an affine matrix to a rendered sprite fragment.
-
-    Takes the fragment at local position (x_off, y_off) and transforms it.
-    Returns (transformed_image, new_x, new_y) in the parent coordinate space.
-    """
-    if mat.a == 1 and mat.b == 0 and mat.c == 0 and mat.d == 1:
-        # Pure translation - skip expensive affine transform
-        return img, x_off + mat.tx, y_off + mat.ty
-
-    w, h = img.size
-
-    # Transform the four corners to find the output bounding box
-    corners = [
-        (x_off, y_off),
-        (x_off + w, y_off),
-        (x_off, y_off + h),
-        (x_off + w, y_off + h),
-    ]
-    txs = [mat.a * cx + mat.b * cy + mat.tx for cx, cy in corners]
-    tys = [mat.c * cx + mat.d * cy + mat.ty for cx, cy in corners]
-
-    out_x_min = min(txs)
-    out_y_min = min(tys)
-    out_x_max = max(txs)
-    out_y_max = max(tys)
-
-    out_w = max(1, int(out_x_max - out_x_min + 1.5))
-    out_h = max(1, int(out_y_max - out_y_min + 1.5))
-
-    if out_w > 4096 or out_h > 4096:
-        return None
-
-    # PIL affine transform uses the INVERSE matrix:
-    # for each output pixel (ox, oy), find input pixel (ix, iy)
-    # We need: (ix - x_off, iy - y_off) in the source image
-    # where (ix, iy) = inv(mat) @ (ox + out_x_min, oy + out_y_min)
-    det = mat.a * mat.d - mat.b * mat.c
-    if abs(det) < 1e-10:
-        return None
-    inv_a = mat.d / det
-    inv_b = -mat.b / det
-    inv_c = -mat.c / det
-    inv_d = mat.a / det
-    inv_tx = (mat.b * mat.ty - mat.d * mat.tx) / det
-    inv_ty = (mat.c * mat.tx - mat.a * mat.ty) / det
-
-    # PIL transform coefficients map output (ox, oy) → input (ix, iy):
-    # ix = a*ox + b*oy + c
-    # iy = d*ox + e*oy + f
-    # We need to account for the output offset (out_x_min, out_y_min) and
-    # the source image offset (x_off, y_off).
-    coeffs = (
-        inv_a,
-        inv_b,
-        inv_a * out_x_min + inv_b * out_y_min + inv_tx - x_off,
-        inv_c,
-        inv_d,
-        inv_c * out_x_min + inv_d * out_y_min + inv_ty - y_off,
-    )
-
-    result = img.transform(
-        (out_w, out_h), Image.AFFINE, coeffs, Image.BILINEAR
-    )
-    return result, out_x_min, out_y_min
 
 
 def composite_parts(
