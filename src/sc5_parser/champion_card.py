@@ -184,8 +184,8 @@ def render_champion_card(
     card_textures: list[Image.Image | None],
     portrait_sc: SC5File,
     portrait_textures: list[Image.Image | None],
-    primary_form: str,
-    secondary_form: str | None = None,
+    primary_form: str = "hero_unlocked",
+    secondary_form: str = "evo_unlocked",
     portrait_scale: float = 0.55,
     card_export: str = "card_item_image_colored_champion",
 ) -> Image.Image | None:
@@ -193,13 +193,15 @@ def render_champion_card(
 
     *primary_form*/*secondary_form*: frame labels like ``hero_unlocked``,
     ``evo_unlocked``.  Primary controls the notch, glow, and right-side
-    diamond; secondary controls the left-side diamond.  If *secondary_form*
-    is ``None``, the primary form is used everywhere.
+    diamond; secondary controls the left-side diamond.  Champion cards are
+    inherently dual-form (champion diamond + form diamond), so both labels
+    default to produce a hero-form champion with purple + gold diamonds.
+
+    Pass ``secondary_form=primary_form`` to force single-form (center
+    diamond only).
 
     Returns a composited RGBA image or ``None`` on failure.
     """
-    if secondary_form is None:
-        secondary_form = primary_form
 
     card_obj = card_sc.exports.get(card_export)
     if card_obj is None:

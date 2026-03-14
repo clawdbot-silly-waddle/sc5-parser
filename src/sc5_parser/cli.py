@@ -313,6 +313,10 @@ def _render_card(args: argparse.Namespace) -> None:
         print("ERROR: Form labels cannot be empty.", file=sys.stderr)
         sys.exit(1)
 
+    kwargs: dict[str, str] = {"primary_form": primary}
+    if secondary is not None:
+        kwargs["secondary_form"] = secondary
+
     card_sctx = _auto_sctx(args.card_sc, args.card_sctx)
     portrait_sctx = _auto_sctx(args.portrait_sc, args.portrait_sctx)
 
@@ -326,15 +330,14 @@ def _render_card(args: argparse.Namespace) -> None:
     portrait_sc = SC5File(args.portrait_sc)
     portrait_tex = _load_textures(portrait_sc, str(Path(portrait_sctx).parent))
 
-    print(f"Forms: primary={primary}, secondary={secondary or primary}")
+    print(f"Forms: primary={primary}, secondary={secondary or '(default)'}")
     print(f"Portrait scale: {args.portrait_scale}")
 
     result = render_champion_card(
         card_sc, card_tex,
         portrait_sc, portrait_tex,
-        primary_form=primary,
-        secondary_form=secondary,
         portrait_scale=args.portrait_scale,
+        **kwargs,
     )
 
     if result is None:
