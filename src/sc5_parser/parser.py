@@ -117,6 +117,29 @@ class MovieClipData:
     frame_labels: list[str] = field(default_factory=list)
 
 
+@dataclass
+class RenderContext:
+    """Optional rendering configuration passed through recursive render calls.
+
+    Allows consumers to customize frame selection, child filtering, and
+    content injection without modifying the SC5File instance.
+    """
+    frame_finder: Callable[[int, str], int] | None = None
+    """Custom frame resolver.  Called as ``frame_finder(mc_id, label)``
+    and should return a frame index.  When ``None`` the default
+    :meth:`SC5File.find_frame_by_label` is used."""
+
+    render_children: dict[int, frozenset[int]] | None = None
+    """Per-MC child filter.  Keys are MC IDs; values are frozensets of
+    allowed ``child_index`` values.  When a MC ID is present in this
+    dict only the listed children are rendered."""
+
+    inject_in_mask: dict[int, list[tuple[Image.Image, float, float, int]]] | None = None
+    """Content to inject into mask groups.  Keys are MC IDs; values are
+    lists of ``(image, x, y, blend_mode)`` tuples that get composited
+    into the mask group at the MASKED modifier boundary."""
+
+
 class SC5File:
     """Parsed representation of an SC v5 file."""
 
@@ -342,7 +365,7 @@ class SC5File:
                 )
 
     # ------------------------------------------------------------------
-    def _get_frame_elements(self, mc_id: int, frame_idx: int = 0) -> list[FrameElement]:
+    def get_frame_elements(self, mc_id: int, frame_idx: int = 0) -> list[FrameElement]:
         """Return frame elements for frame *frame_idx* of movie clip *mc_id*."""
         mcd = self.movie_clip_data.get(mc_id)
         if mcd is None or not mcd.frame_element_counts:
@@ -369,7 +392,7 @@ class SC5File:
             ))
         return result
 
-    def _find_frame_by_label(self, mc_id: int, label: str) -> int:
+    def find_frame_by_label(self, mc_id: int, label: str) -> int:
         """Find frame index by label name, returning 0 if not found."""
         mcd = self.movie_clip_data.get(mc_id)
         if mcd is None:
@@ -379,7 +402,7 @@ class SC5File:
                 return i
         return 0
 
-    def _get_matrix(self, mc_id: int, matrix_index: int) -> Matrix2x3:
+    def get_matrix(self, mc_id: int, matrix_index: int) -> Matrix2x3:
         """Look up a matrix from the appropriate bank for *mc_id*."""
         if matrix_index == _NO_TRANSFORM:
             return Matrix2x3.IDENTITY
@@ -391,7 +414,7 @@ class SC5File:
                 return bank[matrix_index]
         return Matrix2x3.IDENTITY
 
-    def _get_color(self, mc_id: int, color_index: int) -> ColorTransform:
+    def get_color(self, mc_id: int, color_index: int) -> ColorTransform:
         """Look up a color transform from the appropriate bank for *mc_id*."""
         if color_index == _NO_TRANSFORM:
             return ColorTransform.IDENTITY
@@ -452,9 +475,9 @@ class SC5File:
         if len(parts) == 1:
             img, x, y, _ = parts[0]
             return img, x, y
-        return _composite_parts(parts)
+        return composite_parts(parts)
 
-    def _render_object(
+    def render_object(
         self,
         obj_id: int,
         texture_images: list[Image.Image | None],
@@ -466,6 +489,7 @@ class SC5File:
         blend_mode: int = 0,
         child_labels: dict[int, str] | None = None,
         frame_index: int | None = None,
+        ctx: RenderContext | None = None,
     ) -> list[tuple[Image.Image, float, float, int]]:
         """Recursively render an object (shape or movie clip) with transforms.
 
@@ -476,6 +500,8 @@ class SC5File:
         children.  Only children listed are rendered; others are hidden.
         This is consumed at the first MC level (depth 0) and not propagated
         further — each child uses its assigned label recursively.
+        *ctx*: optional render context for custom frame selection, child
+        filtering, and mask content injection.
         *frame_index*: if set, use this frame index directly (0-based) for
         the top-level MC only.  Not propagated to children (they use
         *frame_label* or their own default).
@@ -505,22 +531,23 @@ class SC5File:
         if mcd and obj_id not in visited:
             visited.add(obj_id)
 
-            # Pick frame: frame_index > label match > 0
+            # Pick frame: frame_index > ctx.frame_finder > label match > 0
             frame_idx = 0
             if frame_index is not None:
                 frame_idx = frame_index
+            elif ctx is not None and ctx.frame_finder is not None and frame_label:
+                frame_idx = ctx.frame_finder(obj_id, frame_label)
             elif frame_label:
-                frame_idx = self._find_frame_by_label(obj_id, frame_label)
+                frame_idx = self.find_frame_by_label(obj_id, frame_label)
 
-            elements = self._get_frame_elements(obj_id, frame_idx)
+            elements = self.get_frame_elements(obj_id, frame_idx)
 
             if elements:
-                # Optionally limit which children are rendered (e.g.
-                # to suppress sparkle shapes from glow MCs).
-                _render_children = getattr(self, '_render_children', None)
+                # Optionally limit which children are rendered
                 allowed_children = (
-                    _render_children.get(obj_id)
-                    if _render_children else None
+                    ctx.render_children.get(obj_id)
+                    if ctx is not None and ctx.render_children is not None
+                    else None
                 )
 
                 # Mask state machine for MovieClipModifiers
@@ -549,12 +576,13 @@ class SC5File:
                         # (frame overlays) render on top.
                         if (
                             mask_img is not None
-                            and hasattr(self, "_inject_in_mask")
-                            and obj_id in self._inject_in_mask
+                            and ctx is not None
+                            and ctx.inject_in_mask is not None
+                            and obj_id in ctx.inject_in_mask
                         ):
-                            for inj in self._inject_in_mask[obj_id]:
+                            for inj in ctx.inject_in_mask[obj_id]:
                                 inj_img, inj_x, inj_y, inj_blend = inj
-                                clipped = _clip_to_mask(
+                                clipped = clip_to_mask(
                                     inj_img, inj_x, inj_y,
                                     mask_img, mask_x, mask_y,
                                 )
@@ -578,8 +606,8 @@ class SC5File:
                     else:
                         effective_label = frame_label
 
-                    child_mat = self._get_matrix(obj_id, elem.matrix_index)
-                    child_color = self._get_color(obj_id, elem.color_index)
+                    child_mat = self.get_matrix(obj_id, elem.matrix_index)
+                    child_color = self.get_color(obj_id, elem.color_index)
                     combined = parent_matrix @ child_mat
                     child_blend = (
                         mcd.children_blending[elem.child_index]
@@ -588,18 +616,19 @@ class SC5File:
                     )
 
                     # Render child with normal compositing internally
-                    child_parts = self._render_object(
+                    child_parts = self.render_object(
                         child_id, texture_images, combined, visited,
                         child_color if child_color is not ColorTransform.IDENTITY else color,
                         effective_label, depth + 1,
                         blend_mode=0,
+                        ctx=ctx,
                     )
 
                     # If child has non-zero blend, composite fragments into one image
                     # first, then apply the blend to the single result
                     effective_blend = child_blend if child_blend != 0 else blend_mode
                     if effective_blend != 0 and child_parts and len(child_parts) > 1:
-                        comp = _composite_parts(
+                        comp = composite_parts(
                             [(im, x, y, 0) for im, x, y, _ in child_parts]
                         )
                         if comp:
@@ -615,7 +644,7 @@ class SC5File:
                         # Composite this child into a single mask image
                         capture_mask = False
                         if child_parts:
-                            mask_result = _composite_parts(
+                            mask_result = composite_parts(
                                 [(im, x, y, 0) for im, x, y, _ in child_parts]
                             )
                             if mask_result:
@@ -625,7 +654,7 @@ class SC5File:
                     if apply_mask and mask_img is not None and child_parts:
                         # Clip each fragment to the mask alpha
                         for cp_img, cp_x, cp_y, cp_blend in child_parts:
-                            clipped = _clip_to_mask(
+                            clipped = clip_to_mask(
                                 cp_img, cp_x, cp_y, mask_img, mask_x, mask_y
                             )
                             if clipped is not None:
@@ -642,13 +671,14 @@ class SC5File:
                         else 0
                     )
                     effective_blend = child_blend if child_blend != 0 else blend_mode
-                    child_parts = self._render_object(
+                    child_parts = self.render_object(
                         child_id, texture_images, parent_matrix, visited,
                         color, frame_label, depth + 1,
                         blend_mode=0,
+                        ctx=ctx,
                     )
                     if effective_blend != 0 and child_parts and len(child_parts) > 1:
-                        comp = _composite_parts(
+                        comp = composite_parts(
                             [(im, x, y, 0) for im, x, y, _ in child_parts]
                         )
                         if comp:
@@ -674,6 +704,7 @@ class SC5File:
         frame_label: str | None = None,
         child_labels: dict[int, str] | None = None,
         frame_index: int | None = None,
+        ctx: RenderContext | None = None,
     ) -> Image.Image | None:
         """Extract a named sprite, compositing all shapes with correct transforms.
 
@@ -689,17 +720,18 @@ class SC5File:
         if obj_id is None:
             return None
 
-        rendered = self._render_object(
+        rendered = self.render_object(
             obj_id, texture_images, Matrix2x3.IDENTITY, set(),
             frame_label=frame_label,
             child_labels=child_labels,
             frame_index=frame_index,
+            ctx=ctx,
         )
 
         if not rendered:
             return None
 
-        result = _composite_parts(rendered)
+        result = composite_parts(rendered)
         if result is None:
             return None
 
@@ -715,6 +747,7 @@ class SC5File:
         frame_label: str | None = None,
         child_labels: dict[int, str] | None = None,
         frame_index: int | None = None,
+        ctx: RenderContext | None = None,
     ) -> tuple[Image.Image, float, float] | None:
         """Like extract_sprite but returns (image, x_offset, y_offset).
 
@@ -725,17 +758,18 @@ class SC5File:
         if obj_id is None:
             return None
 
-        rendered = self._render_object(
+        rendered = self.render_object(
             obj_id, texture_images, Matrix2x3.IDENTITY, set(),
             frame_label=frame_label,
             child_labels=child_labels,
             frame_index=frame_index,
+            ctx=ctx,
         )
 
         if not rendered:
             return None
 
-        return _composite_parts(rendered)
+        return composite_parts(rendered)
 
     # ------------------------------------------------------------------
     def get_export_frame_info(self, export_name: str) -> dict[str, Any] | None:
@@ -784,7 +818,7 @@ class SC5File:
 # Helpers
 # ======================================================================
 
-def _clip_to_mask(
+def clip_to_mask(
     img: Image.Image,
     img_x: float,
     img_y: float,
@@ -894,7 +928,7 @@ def _apply_matrix(
     return result, out_x_min, out_y_min
 
 
-def _composite_parts(
+def composite_parts(
     parts: list[tuple[Image.Image, float, float, int]],
 ) -> tuple[Image.Image, float, float] | None:
     """Composite multiple (image, x, y, blend_mode) fragments into one image.
@@ -920,14 +954,14 @@ def _composite_parts(
         py = int(yo - all_y_min)
         if blend == 8:
             # Additive blend: add RGB weighted by overlay alpha, keep base alpha
-            _additive_blend(result, img, px, py)
+            additive_blend(result, img, px, py)
         else:
             result.alpha_composite(img, (px, py))
 
     return result, all_x_min, all_y_min
 
 
-def _additive_blend(
+def additive_blend(
     base: Image.Image,
     overlay: Image.Image,
     px: int,
@@ -962,227 +996,3 @@ def _additive_blend(
     base_arr[y1:y2, x1:x2] = bslice.astype(np.uint8)
     base.paste(Image.fromarray(base_arr))
 
-
-# ======================================================================
-# Champion card compositor
-# ======================================================================
-
-# MC 1008 child indices for card_frame_champion:
-_CARD_CHILD_NOTCH_BASE = 0  # MC 982: full-width notch
-_CARD_CHILD_NOTCH_RIGHT = 1  # MC 987: right half overlay
-_CARD_CHILD_NOTCH_LEFT = 2  # MC 988: left half overlay
-_CARD_CHILD_GLOW = 3  # MC 1001: frame glow border + mask
-_CARD_CHILD_DIAMOND_RIGHT = 5  # MC 1005 @ tx=18.5
-_CARD_CHILD_DIAMOND_LEFT = 6  # MC 1005 @ tx=-18.6
-
-# Glow sub-MCs (990=evo, 1000=hero) have 34 frames. Frames 0-3 are
-# empty, 4-32 show particles/clouds, and frame 33 is a clean border
-# with just the outline shape and clipping mask (no particle effects).
-_GLOW_CLEAN_FRAME = 29
-
-# Inner glow MCs (849=evo, 973=hero) always include sparkle shapes in
-# every frame.  For a static card render we only want child 0 (the frame
-# border Shape 397) — sparkle edges create visible artifacts.
-_GLOW_BORDER_ONLY: dict[int, frozenset[int]] = {
-    849: frozenset({0}),
-    973: frozenset({0}),
-}
-
-# Shape 392 is the card portrait clipping mask — a solid rounded rectangle
-# matching the interior of the champion frame border.
-_CARD_PORTRAIT_MASK_SHAPE = 392
-
-
-def _mask_hierarchy_transform(
-    card_sc: SC5File,
-    card_mc_id: int,
-    frame_finder: Callable[[int, str], int],
-    glow_label: str = "",
-) -> tuple[Matrix2x3, int | None]:
-    """Compute the accumulated transform from the card MC to Shape 392.
-
-    Traces: card MC → child[_CARD_CHILD_GLOW] (MC 1001) → inner glow MC
-    (MC 990/1000) → Shape 392, multiplying matrices along the path.
-
-    *glow_label* is forwarded to *frame_finder* when selecting which inner
-    glow MC to follow (e.g. ``"hero_unlocked"``).
-
-    Returns ``(transform, inner_glow_mc_id)`` where *inner_glow_mc_id* is
-    the MC that contains the mask group (Mask / Masked / Unmasked).
-    """
-    result = Matrix2x3.IDENTITY
-    card_mcd = card_sc.movie_clip_data.get(card_mc_id)
-    if card_mcd is None:
-        return result, None
-
-    # Step 1: card MC → glow child
-    card_fe = card_sc._get_frame_elements(card_mc_id, 0)
-    glow_mc_id: int | None = None
-    for elem in card_fe:
-        if elem.child_index == _CARD_CHILD_GLOW:
-            result = result @ card_sc._get_matrix(card_mc_id, elem.matrix_index)
-            glow_mc_id = card_mcd.children_ids[_CARD_CHILD_GLOW]
-            break
-    if glow_mc_id is None:
-        return result, None
-
-    # Step 2: glow MC → inner glow MC (990 or 1000)
-    glow_mcd = card_sc.movie_clip_data.get(glow_mc_id)
-    if glow_mcd is None:
-        return result, None
-    glow_frame = frame_finder(glow_mc_id, glow_label)
-    glow_fe = card_sc._get_frame_elements(glow_mc_id, glow_frame)
-    if not glow_fe:
-        return result, None
-    result = result @ card_sc._get_matrix(glow_mc_id, glow_fe[0].matrix_index)
-    inner_mc_id = glow_mcd.children_ids[glow_fe[0].child_index]
-
-    # Step 3: inner glow MC → Shape 392
-    inner_mcd = card_sc.movie_clip_data.get(inner_mc_id)
-    if inner_mcd is None:
-        return result, inner_mc_id
-    inner_frame = min(_GLOW_CLEAN_FRAME, len(inner_mcd.frame_element_counts) - 1)
-    inner_fe = card_sc._get_frame_elements(inner_mc_id, inner_frame)
-    for ie in inner_fe:
-        if (ie.child_index < len(inner_mcd.children_ids)
-                and inner_mcd.children_ids[ie.child_index]
-                == _CARD_PORTRAIT_MASK_SHAPE):
-            result = result @ card_sc._get_matrix(inner_mc_id, ie.matrix_index)
-            break
-
-    return result, inner_mc_id
-
-
-def render_champion_card(
-    card_sc: SC5File,
-    card_textures: list[Image.Image | None],
-    portrait_sc: SC5File,
-    portrait_textures: list[Image.Image | None],
-    primary_form: str,
-    secondary_form: str | None = None,
-    portrait_scale: float = 0.55,
-    card_export: str = "card_item_image_colored_champion",
-) -> Image.Image | None:
-    """Render a complete champion card with portrait and overlay.
-
-    *primary_form*/*secondary_form*: frame labels like ``hero_unlocked``,
-    ``evo_unlocked``.  Primary controls the notch, glow, and right-side
-    diamond; secondary controls the left-side diamond.  If *secondary_form*
-    is ``None``, the primary form is used everywhere.
-
-    Returns a composited RGBA image or ``None`` on failure.
-    """
-    if secondary_form is None:
-        secondary_form = primary_form
-
-    # --- Render card overlay parts individually (preserving blend modes) ---
-    original_find = card_sc._find_frame_by_label
-
-    def _clean_glow_find(mc_id: int, label: str) -> int:
-        mcd = card_sc.movie_clip_data.get(mc_id)
-        if mcd is None:
-            return 0
-        # Champion cards use the hero_unlocked glow variant
-        effective = "hero_unlocked" if label == "champion" and mc_id == 1001 else label
-        for i, fl in enumerate(mcd.frame_labels):
-            if fl == effective:
-                return i
-        # Glow sub-MCs: use clean frame (border only, no particle clouds)
-        if mc_id in (990, 1000):
-            return min(_GLOW_CLEAN_FRAME, len(mcd.frame_element_counts) - 1)
-        for i, c in enumerate(mcd.frame_element_counts):
-            if c > 0:
-                return i
-        return 0
-
-    card_sc._find_frame_by_label = _clean_glow_find
-    card_sc._render_children = _GLOW_BORDER_ONLY  # suppress sparkles
-
-    card_obj = card_sc.exports.get(card_export)
-    if card_obj is None:
-        card_sc._find_frame_by_label = original_find
-        del card_sc._render_children
-        return None
-
-    # --- Render portrait ---
-    portrait_exports = list(portrait_sc.exports.values())
-    if portrait_exports:
-        portrait_obj = portrait_exports[0]
-    elif portrait_sc.movie_clip_data:
-        portrait_obj = next(iter(portrait_sc.movie_clip_data))
-    else:
-        return None
-
-    portrait_parts = portrait_sc._render_object(
-        portrait_obj, portrait_textures, Matrix2x3.IDENTITY, set(),
-    )
-    if not portrait_parts:
-        return None
-
-    portrait_result = _composite_parts(portrait_parts)
-    if portrait_result is None:
-        return None
-    p_img, p_x, p_y = portrait_result
-
-    p_scaled = p_img.resize(
-        (int(p_img.width * portrait_scale), int(p_img.height * portrait_scale)),
-        Image.LANCZOS,
-    )
-
-    # The portrait sits between the Masked/Unmasked modifiers inside the
-    # inner glow MC (e.g. MC 1000).  Compute the accumulated hierarchy
-    # transform so we can place the portrait in card-root coordinates,
-    # then let the mask state machine clip it automatically.
-    mask_matrix, inner_mc_id = _mask_hierarchy_transform(
-        card_sc, card_obj, _clean_glow_find, glow_label=primary_form,
-    )
-    sp_x = p_x * portrait_scale + mask_matrix.tx
-    sp_y = p_y * portrait_scale + mask_matrix.ty
-
-    # Register the portrait for injection into the inner glow MC's mask
-    # group.  _render_object will insert it just before Unmasked, so the
-    # mask clips it and the z-order matches the game automatically.
-    if inner_mc_id is not None:
-        card_sc._inject_in_mask = {
-            inner_mc_id: [(p_scaled, sp_x, sp_y, 0)],
-        }
-
-    # --- Render card in a single pass ---
-    child_labels = {
-        _CARD_CHILD_NOTCH_BASE: primary_form,
-        _CARD_CHILD_GLOW: primary_form,
-        _CARD_CHILD_DIAMOND_RIGHT: primary_form,
-        _CARD_CHILD_DIAMOND_LEFT: secondary_form,
-    }
-    card_parts = card_sc._render_object(
-        card_obj, card_textures, Matrix2x3.IDENTITY, set(),
-        child_labels=child_labels,
-    )
-    card_sc._find_frame_by_label = original_find
-    del card_sc._render_children
-    if hasattr(card_sc, "_inject_in_mask"):
-        del card_sc._inject_in_mask
-
-    if not card_parts:
-        return None
-
-    # --- Composite ---
-    all_parts = card_parts
-    xmin = min(x for _, x, _, _ in all_parts) - 1
-    ymin = min(y for _, _, y, _ in all_parts) - 1
-    xmax = max(x + img.width for img, x, _, _ in all_parts) + 1
-    ymax = max(y + img.height for img, _, y, _ in all_parts) + 1
-    cw = int(xmax - xmin + 0.5)
-    ch = int(ymax - ymin + 0.5)
-
-    canvas = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
-
-    for img, xo, yo, blend in all_parts:
-        px = int(xo - xmin + 0.5)
-        py = int(yo - ymin + 0.5)
-        if blend == 8:
-            _additive_blend(canvas, img, px, py)
-        else:
-            canvas.alpha_composite(img, (px, py))
-
-    return canvas

@@ -59,30 +59,20 @@ sc5-parser ui_card_items.sc --extract card_item_image_colored_champion \
 Format: `INDEX:LABEL,INDEX:LABEL,...` where INDEX is the child position in
 the MC's children array.
 
-#### Champion Card Structure (MC 1008)
+### Champion Card Rendering
 
+The `render-card` subcommand composites a champion card with portrait:
+
+```bash
+sc5-parser render-card \
+  --card-sc ui_card_items.sc \
+  --portrait-sc ui_card_knight_hero.sc \
+  --forms hero_unlocked \
+  --zoom 4 \
+  -o card.png
 ```
-child[0] MC 982  "hero_activate_anim"  — full-width base notch (99px)
-child[1] MC 987  "bg_full"             — right half overlay (50px)
-child[2] MC 988  "bg_right"            — left half overlay (50px)
-child[3] MC 1001 "evo_glow"            — glow effect
-child[4] MC 1005 "bg_left"             — CENTER diamond slot
-child[5] MC 1005 "diamond_center"      — RIGHT diamond slot
-child[6] MC 1005 "diamond_right"       — LEFT diamond slot
-child[7] MC 572  "frame_anim"          — animation (empty)
-```
 
-**NOTE**: Instance names don't match positions — "bg_left" is actually the
-center diamond, "diamond_center" is the right one, etc.
-
-**Rendering rules:**
-- **Single form** (hero-only or evo-only): Show base (child 0) + center
-  diamond (child 4). Hide halves (children 1,2) and outer diamonds (5,6).
-- **Dual form** (hero+evo): Show base (child 0) + both halves (children 1,2)
-  + outer diamonds (children 5,6). The base fills the seam between halves.
-- **Diamond labels**: `evo_locked`/`evo_unlocked`/`evo_active` (purple/gold),
-  `hero_locked`/`hero_unlocked` (gold). The frame colour difference between
-  evo and hero diamonds is baked into the sprite art (shapes 491 vs 493).
+See `champion_card.py` for the full structure documentation.
 
 ## SC v5 File Format
 

@@ -7,7 +7,8 @@ import os
 import sys
 from pathlib import Path
 
-from sc5_parser.parser import SC5File, render_champion_card
+from sc5_parser.parser import SC5File
+from sc5_parser.champion_card import render_champion_card
 from sc5_parser.sctx import decode_sctx
 
 

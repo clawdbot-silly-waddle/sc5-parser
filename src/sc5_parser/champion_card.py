@@ -1,0 +1,278 @@
+"""Champion card compositor for Clash Royale.
+
+Renders a complete champion card image by compositing a portrait into the
+card frame overlay from ``ui_card_items.sc``.  This module is a *consumer*
+of the ``sc5_parser`` library — it uses only the public API.
+
+Champion Card Structure (MC 1008 ``card_item_image_colored_champion``)
+----------------------------------------------------------------------
+
+::
+
+    child[0] MC 982  "hero_activate_anim"  — full-width base notch (99px)
+    child[1] MC 987  "bg_full"             — right half overlay (50px)
+    child[2] MC 988  "bg_right"            — left half overlay (50px)
+    child[3] MC 1001 "evo_glow"            — glow effect
+    child[4] MC 1005 "bg_left"             — CENTER diamond slot
+    child[5] MC 1005 "diamond_center"      — RIGHT diamond slot
+    child[6] MC 1005 "diamond_right"       — LEFT diamond slot
+    child[7] MC 572  "frame_anim"          — animation (empty)
+
+**NOTE**: Instance names don't match positions — "bg_left" is actually the
+center diamond, "diamond_center" is the right one, etc.
+
+Rendering rules
+~~~~~~~~~~~~~~~
+
+- **Single form** (hero-only or evo-only): Show base (child 0) + center
+  diamond (child 4).  Hide halves (children 1, 2) and outer diamonds (5, 6).
+- **Dual form** (hero+evo): Show base (child 0) + both halves (children 1, 2)
+  + outer diamonds (children 5, 6).  The base fills the seam between halves.
+- **Diamond labels**: ``evo_locked``/``evo_unlocked``/``evo_active`` (purple/gold),
+  ``hero_locked``/``hero_unlocked`` (gold).
+"""
+
+from __future__ import annotations
+
+from typing import Callable
+
+from PIL import Image
+
+from sc5_parser.parser import (
+    Matrix2x3,
+    RenderContext,
+    SC5File,
+    additive_blend,
+    composite_parts,
+)
+
+# -- MC 1008 child indices -------------------------------------------------
+
+CHILD_NOTCH_BASE = 0      # MC 982: full-width notch
+CHILD_NOTCH_RIGHT = 1     # MC 987: right half overlay
+CHILD_NOTCH_LEFT = 2      # MC 988: left half overlay
+CHILD_GLOW = 3            # MC 1001: frame glow border + mask
+CHILD_DIAMOND_CENTER = 4  # MC 1005 (actually "bg_left")
+CHILD_DIAMOND_RIGHT = 5   # MC 1005 @ tx=18.5
+CHILD_DIAMOND_LEFT = 6    # MC 1005 @ tx=-18.6
+
+# -- Glow rendering config -------------------------------------------------
+
+# Glow sub-MCs (990=evo, 1000=hero) have 34 frames.  Frame 29 is a clean
+# border with the outline shape, clipping mask, and overlay children but
+# no particle/sparkle effects.
+_GLOW_CLEAN_FRAME = 29
+
+# Inner glow MCs (849=evo, 973=hero) include sparkle shapes in every frame.
+# For a static card render we only want child 0 (the frame border shape) —
+# sparkle edges create visible artifacts.
+_GLOW_BORDER_ONLY: dict[int, frozenset[int]] = {
+    849: frozenset({0}),
+    973: frozenset({0}),
+}
+
+# Shape 392 is the card portrait clipping mask — a solid rounded rectangle
+# matching the interior of the champion frame border.
+_PORTRAIT_MASK_SHAPE = 392
+
+
+# -- Internal helpers -------------------------------------------------------
+
+def _make_frame_finder(
+    sc: SC5File,
+) -> Callable[[int, str], int]:
+    """Build a frame-finder callback for champion card rendering.
+
+    The returned callable resolves frame labels with special handling for
+    glow sub-MCs (selecting the clean-border frame) and the champion →
+    hero_unlocked alias.
+    """
+    def _find(mc_id: int, label: str) -> int:
+        mcd = sc.movie_clip_data.get(mc_id)
+        if mcd is None:
+            return 0
+        effective = (
+            "hero_unlocked" if label == "champion" and mc_id == 1001
+            else label
+        )
+        for i, fl in enumerate(mcd.frame_labels):
+            if fl == effective:
+                return i
+        # Glow sub-MCs: use clean frame (border only, no particle clouds)
+        if mc_id in (990, 1000):
+            return min(_GLOW_CLEAN_FRAME, len(mcd.frame_element_counts) - 1)
+        for i, c in enumerate(mcd.frame_element_counts):
+            if c > 0:
+                return i
+        return 0
+
+    return _find
+
+
+def _mask_hierarchy_transform(
+    card_sc: SC5File,
+    card_mc_id: int,
+    frame_finder: Callable[[int, str], int],
+    glow_label: str = "",
+) -> tuple[Matrix2x3, int | None]:
+    """Compute the accumulated transform from the card MC to the mask shape.
+
+    Traces: card MC → child[CHILD_GLOW] (MC 1001) → inner glow MC
+    (MC 990/1000) → Shape 392, multiplying matrices along the path.
+
+    Returns ``(transform, inner_glow_mc_id)`` where *inner_glow_mc_id* is
+    the MC that contains the mask group (Mask / Masked / Unmasked).
+    """
+    result = Matrix2x3.IDENTITY
+    card_mcd = card_sc.movie_clip_data.get(card_mc_id)
+    if card_mcd is None:
+        return result, None
+
+    # Step 1: card MC → glow child
+    card_fe = card_sc.get_frame_elements(card_mc_id, 0)
+    glow_mc_id: int | None = None
+    for elem in card_fe:
+        if elem.child_index == CHILD_GLOW:
+            result = result @ card_sc.get_matrix(card_mc_id, elem.matrix_index)
+            glow_mc_id = card_mcd.children_ids[CHILD_GLOW]
+            break
+    if glow_mc_id is None:
+        return result, None
+
+    # Step 2: glow MC → inner glow MC (990 or 1000)
+    glow_mcd = card_sc.movie_clip_data.get(glow_mc_id)
+    if glow_mcd is None:
+        return result, None
+    glow_frame = frame_finder(glow_mc_id, glow_label)
+    glow_fe = card_sc.get_frame_elements(glow_mc_id, glow_frame)
+    if not glow_fe:
+        return result, None
+    result = result @ card_sc.get_matrix(glow_mc_id, glow_fe[0].matrix_index)
+    inner_mc_id = glow_mcd.children_ids[glow_fe[0].child_index]
+
+    # Step 3: inner glow MC → portrait mask shape
+    inner_mcd = card_sc.movie_clip_data.get(inner_mc_id)
+    if inner_mcd is None:
+        return result, inner_mc_id
+    inner_frame = min(_GLOW_CLEAN_FRAME, len(inner_mcd.frame_element_counts) - 1)
+    inner_fe = card_sc.get_frame_elements(inner_mc_id, inner_frame)
+    for ie in inner_fe:
+        if (ie.child_index < len(inner_mcd.children_ids)
+                and inner_mcd.children_ids[ie.child_index]
+                == _PORTRAIT_MASK_SHAPE):
+            result = result @ card_sc.get_matrix(inner_mc_id, ie.matrix_index)
+            break
+
+    return result, inner_mc_id
+
+
+# -- Public API -------------------------------------------------------------
+
+def render_champion_card(
+    card_sc: SC5File,
+    card_textures: list[Image.Image | None],
+    portrait_sc: SC5File,
+    portrait_textures: list[Image.Image | None],
+    primary_form: str,
+    secondary_form: str | None = None,
+    portrait_scale: float = 0.55,
+    card_export: str = "card_item_image_colored_champion",
+) -> Image.Image | None:
+    """Render a complete champion card with portrait and overlay.
+
+    *primary_form*/*secondary_form*: frame labels like ``hero_unlocked``,
+    ``evo_unlocked``.  Primary controls the notch, glow, and right-side
+    diamond; secondary controls the left-side diamond.  If *secondary_form*
+    is ``None``, the primary form is used everywhere.
+
+    Returns a composited RGBA image or ``None`` on failure.
+    """
+    if secondary_form is None:
+        secondary_form = primary_form
+
+    card_obj = card_sc.exports.get(card_export)
+    if card_obj is None:
+        return None
+
+    frame_finder = _make_frame_finder(card_sc)
+
+    # --- Render portrait ---------------------------------------------------
+    portrait_exports = list(portrait_sc.exports.values())
+    if portrait_exports:
+        portrait_obj = portrait_exports[0]
+    elif portrait_sc.movie_clip_data:
+        portrait_obj = next(iter(portrait_sc.movie_clip_data))
+    else:
+        return None
+
+    portrait_parts = portrait_sc.render_object(
+        portrait_obj, portrait_textures, Matrix2x3.IDENTITY, set(),
+    )
+    if not portrait_parts:
+        return None
+
+    portrait_result = composite_parts(portrait_parts)
+    if portrait_result is None:
+        return None
+    p_img, p_x, p_y = portrait_result
+
+    p_scaled = p_img.resize(
+        (int(p_img.width * portrait_scale), int(p_img.height * portrait_scale)),
+        Image.LANCZOS,
+    )
+
+    # Compute the accumulated hierarchy transform so we can place the
+    # portrait in card-root coordinates for mask clipping.
+    mask_matrix, inner_mc_id = _mask_hierarchy_transform(
+        card_sc, card_obj, frame_finder, glow_label=primary_form,
+    )
+    sp_x = p_x * portrait_scale + mask_matrix.tx
+    sp_y = p_y * portrait_scale + mask_matrix.ty
+
+    # Build render context: custom frame finder, sparkle suppression,
+    # and portrait injection into the mask group.
+    ctx = RenderContext(
+        frame_finder=frame_finder,
+        render_children=_GLOW_BORDER_ONLY,
+        inject_in_mask=(
+            {inner_mc_id: [(p_scaled, sp_x, sp_y, 0)]}
+            if inner_mc_id is not None
+            else None
+        ),
+    )
+
+    # --- Render card in a single pass --------------------------------------
+    child_labels = {
+        CHILD_NOTCH_BASE: primary_form,
+        CHILD_GLOW: primary_form,
+        CHILD_DIAMOND_RIGHT: primary_form,
+        CHILD_DIAMOND_LEFT: secondary_form,
+    }
+    card_parts = card_sc.render_object(
+        card_obj, card_textures, Matrix2x3.IDENTITY, set(),
+        child_labels=child_labels,
+        ctx=ctx,
+    )
+
+    if not card_parts:
+        return None
+
+    # --- Composite ---------------------------------------------------------
+    xmin = min(x for _, x, _, _ in card_parts) - 1
+    ymin = min(y for _, _, y, _ in card_parts) - 1
+    xmax = max(x + img.width for img, x, _, _ in card_parts) + 1
+    ymax = max(y + img.height for img, _, y, _ in card_parts) + 1
+    cw = int(xmax - xmin + 0.5)
+    ch = int(ymax - ymin + 0.5)
+
+    canvas = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+
+    for img, xo, yo, blend in card_parts:
+        px = int(xo - xmin + 0.5)
+        py = int(yo - ymin + 0.5)
+        if blend == 8:
+            additive_blend(canvas, img, px, py)
+        else:
+            canvas.alpha_composite(img, (px, py))
+
+    return canvas
