@@ -544,9 +544,9 @@ class SC5File:
                         continue
                     elif mod_type == _MOD_MASKED:
                         apply_mask = True
-                        continue
-                    elif mod_type == _MOD_UNMASKED:
-                        # Inject registered content before leaving mask group
+                        # Inject registered content at the start of the
+                        # masked region so that subsequent masked children
+                        # (frame overlays) render on top.
                         if (
                             mask_img is not None
                             and hasattr(self, "_inject_in_mask")
@@ -563,6 +563,8 @@ class SC5File:
                                     rendered.append(
                                         (c_img, c_x, c_y, inj_blend)
                                     )
+                        continue
+                    elif mod_type == _MOD_UNMASKED:
                         apply_mask = False
                         mask_img = None
                         continue
@@ -976,7 +978,7 @@ _CARD_CHILD_DIAMOND_LEFT = 6  # MC 1005 @ tx=-18.6
 # Glow sub-MCs (990=evo, 1000=hero) have 34 frames. Frames 0-3 are
 # empty, 4-32 show particles/clouds, and frame 33 is a clean border
 # with just the outline shape and clipping mask (no particle effects).
-_GLOW_CLEAN_FRAME = 33
+_GLOW_CLEAN_FRAME = 29
 
 # Inner glow MCs (849=evo, 973=hero) always include sparkle shapes in
 # every frame.  For a static card render we only want child 0 (the frame
