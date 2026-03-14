@@ -10,7 +10,7 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import zstandard
@@ -956,6 +956,59 @@ _GLOW_CLEAN_FRAME = 33
 _CARD_PORTRAIT_MASK_SHAPE = 392
 
 
+def _mask_hierarchy_transform(
+    card_sc: SC5File,
+    card_mc_id: int,
+    frame_finder: Callable[[int, str], int],
+) -> Matrix2x3:
+    """Compute the accumulated transform from the card MC to Shape 392.
+
+    Traces: card MC → child[_CARD_CHILD_GLOW] (MC 1001) → inner glow MC
+    (MC 990/1000) → Shape 392, multiplying matrices along the path.
+    """
+    result = Matrix2x3.IDENTITY
+    card_mcd = card_sc.movie_clip_data.get(card_mc_id)
+    if card_mcd is None:
+        return result
+
+    # Step 1: card MC → glow child
+    card_fe = card_sc._get_frame_elements(card_mc_id, 0)
+    glow_mc_id: int | None = None
+    for elem in card_fe:
+        if elem.child_index == _CARD_CHILD_GLOW:
+            result = result @ card_sc._get_matrix(card_mc_id, elem.matrix_index)
+            glow_mc_id = card_mcd.children_ids[_CARD_CHILD_GLOW]
+            break
+    if glow_mc_id is None:
+        return result
+
+    # Step 2: glow MC → inner glow MC (990 or 1000)
+    glow_mcd = card_sc.movie_clip_data.get(glow_mc_id)
+    if glow_mcd is None:
+        return result
+    glow_frame = frame_finder(glow_mc_id, "")
+    glow_fe = card_sc._get_frame_elements(glow_mc_id, glow_frame)
+    if not glow_fe:
+        return result
+    result = result @ card_sc._get_matrix(glow_mc_id, glow_fe[0].matrix_index)
+    inner_mc_id = glow_mcd.children_ids[glow_fe[0].child_index]
+
+    # Step 3: inner glow MC → Shape 392
+    inner_mcd = card_sc.movie_clip_data.get(inner_mc_id)
+    if inner_mcd is None:
+        return result
+    inner_frame = min(_GLOW_CLEAN_FRAME, len(inner_mcd.frame_element_counts) - 1)
+    inner_fe = card_sc._get_frame_elements(inner_mc_id, inner_frame)
+    for ie in inner_fe:
+        if (ie.child_index < len(inner_mcd.children_ids)
+                and inner_mcd.children_ids[ie.child_index]
+                == _CARD_PORTRAIT_MASK_SHAPE):
+            result = result @ card_sc._get_matrix(inner_mc_id, ie.matrix_index)
+            break
+
+    return result
+
+
 def render_champion_card(
     card_sc: SC5File,
     card_textures: list[Image.Image | None],
@@ -1040,8 +1093,12 @@ def render_champion_card(
     p_img, p_x, p_y = portrait_result
 
     # --- Scale and clip portrait to card mask ---
+    # Shape 392 lives inside the glow MC hierarchy.  When rendering it in
+    # isolation we must apply the same accumulated transform the hierarchy
+    # would give it:  card MC → glow child → inner glow MC → shape 392.
+    mask_matrix = _mask_hierarchy_transform(card_sc, card_obj, _clean_glow_find)
     mask_parts = card_sc._render_object(
-        _CARD_PORTRAIT_MASK_SHAPE, card_textures, Matrix2x3.IDENTITY, set(),
+        _CARD_PORTRAIT_MASK_SHAPE, card_textures, mask_matrix, set(),
     )
     if not mask_parts:
         return None
