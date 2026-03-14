@@ -546,6 +546,23 @@ class SC5File:
                         apply_mask = True
                         continue
                     elif mod_type == _MOD_UNMASKED:
+                        # Inject registered content before leaving mask group
+                        if (
+                            mask_img is not None
+                            and hasattr(self, "_inject_in_mask")
+                            and obj_id in self._inject_in_mask
+                        ):
+                            for inj in self._inject_in_mask[obj_id]:
+                                inj_img, inj_x, inj_y, inj_blend = inj
+                                clipped = _clip_to_mask(
+                                    inj_img, inj_x, inj_y,
+                                    mask_img, mask_x, mask_y,
+                                )
+                                if clipped is not None:
+                                    c_img, c_x, c_y = clipped
+                                    rendered.append(
+                                        (c_img, c_x, c_y, inj_blend)
+                                    )
                         apply_mask = False
                         mask_img = None
                         continue
@@ -978,16 +995,23 @@ def _mask_hierarchy_transform(
     card_sc: SC5File,
     card_mc_id: int,
     frame_finder: Callable[[int, str], int],
-) -> Matrix2x3:
+    glow_label: str = "",
+) -> tuple[Matrix2x3, int | None]:
     """Compute the accumulated transform from the card MC to Shape 392.
 
     Traces: card MC → child[_CARD_CHILD_GLOW] (MC 1001) → inner glow MC
     (MC 990/1000) → Shape 392, multiplying matrices along the path.
+
+    *glow_label* is forwarded to *frame_finder* when selecting which inner
+    glow MC to follow (e.g. ``"hero_unlocked"``).
+
+    Returns ``(transform, inner_glow_mc_id)`` where *inner_glow_mc_id* is
+    the MC that contains the mask group (Mask / Masked / Unmasked).
     """
     result = Matrix2x3.IDENTITY
     card_mcd = card_sc.movie_clip_data.get(card_mc_id)
     if card_mcd is None:
-        return result
+        return result, None
 
     # Step 1: card MC → glow child
     card_fe = card_sc._get_frame_elements(card_mc_id, 0)
@@ -998,23 +1022,23 @@ def _mask_hierarchy_transform(
             glow_mc_id = card_mcd.children_ids[_CARD_CHILD_GLOW]
             break
     if glow_mc_id is None:
-        return result
+        return result, None
 
     # Step 2: glow MC → inner glow MC (990 or 1000)
     glow_mcd = card_sc.movie_clip_data.get(glow_mc_id)
     if glow_mcd is None:
-        return result
-    glow_frame = frame_finder(glow_mc_id, "")
+        return result, None
+    glow_frame = frame_finder(glow_mc_id, glow_label)
     glow_fe = card_sc._get_frame_elements(glow_mc_id, glow_frame)
     if not glow_fe:
-        return result
+        return result, None
     result = result @ card_sc._get_matrix(glow_mc_id, glow_fe[0].matrix_index)
     inner_mc_id = glow_mcd.children_ids[glow_fe[0].child_index]
 
     # Step 3: inner glow MC → Shape 392
     inner_mcd = card_sc.movie_clip_data.get(inner_mc_id)
     if inner_mcd is None:
-        return result
+        return result, inner_mc_id
     inner_frame = min(_GLOW_CLEAN_FRAME, len(inner_mcd.frame_element_counts) - 1)
     inner_fe = card_sc._get_frame_elements(inner_mc_id, inner_frame)
     for ie in inner_fe:
@@ -1024,7 +1048,7 @@ def _mask_hierarchy_transform(
             result = result @ card_sc._get_matrix(inner_mc_id, ie.matrix_index)
             break
 
-    return result
+    return result, inner_mc_id
 
 
 def render_champion_card(
@@ -1078,31 +1102,6 @@ def render_champion_card(
         del card_sc._render_children
         return None
 
-    # Render three child groups separately so that we can insert the
-    # portrait between the glow border and the overlay parts.  In the
-    # game MC 1008 draws: notch → glow(+portrait inside) → diamonds.
-    _render_args = (card_obj, card_textures, Matrix2x3.IDENTITY, set())
-    notch_parts = card_sc._render_object(
-        *_render_args,
-        child_labels={_CARD_CHILD_NOTCH_BASE: primary_form},
-    )
-    glow_parts = card_sc._render_object(
-        *_render_args,
-        child_labels={_CARD_CHILD_GLOW: primary_form},
-    )
-    diamond_parts = card_sc._render_object(
-        *_render_args,
-        child_labels={
-            _CARD_CHILD_DIAMOND_RIGHT: primary_form,
-            _CARD_CHILD_DIAMOND_LEFT: secondary_form,
-        },
-    )
-    card_sc._find_frame_by_label = original_find
-    del card_sc._render_children
-
-    if not glow_parts and not notch_parts and not diamond_parts:
-        return None
-
     # --- Render portrait ---
     portrait_exports = list(portrait_sc.exports.values())
     if portrait_exports:
@@ -1123,59 +1122,50 @@ def render_champion_card(
         return None
     p_img, p_x, p_y = portrait_result
 
-    # --- Scale and clip portrait to card mask ---
-    # Shape 392 lives inside the glow MC hierarchy.  When rendering it in
-    # isolation we must apply the same accumulated transform the hierarchy
-    # would give it:  card MC → glow child → inner glow MC → shape 392.
-    mask_matrix = _mask_hierarchy_transform(card_sc, card_obj, _clean_glow_find)
-    mask_parts = card_sc._render_object(
-        _CARD_PORTRAIT_MASK_SHAPE, card_textures, mask_matrix, set(),
-    )
-    if not mask_parts:
-        return None
-    mask_result = _composite_parts(mask_parts)
-    if mask_result is None:
-        return None
-    m_img, m_x, m_y = mask_result
-    m_alpha = np.array(m_img)[:, :, 3]
-    m_binary = np.where(m_alpha > 0, 255, 0).astype(np.uint8)
-
     p_scaled = p_img.resize(
         (int(p_img.width * portrait_scale), int(p_img.height * portrait_scale)),
         Image.LANCZOS,
     )
-    sp_x, sp_y = p_x * portrait_scale, p_y * portrait_scale
 
-    # In the game the portrait is placed between the Masked / Unmasked
-    # modifiers inside the inner glow MC (1000).  Its local origin sits
-    # at MC 1000's (0,0), which is offset from the card root by the same
-    # accumulated hierarchy transform that reaches Shape 392.  Apply that
-    # transform so the portrait and mask share the same coordinate origin.
-    sp_x += mask_matrix.tx
-    sp_y += mask_matrix.ty
-
-    clip_mask = Image.new("L", p_scaled.size, 0)
-    clip_mask.paste(
-        Image.fromarray(m_binary),
-        (int(m_x - sp_x + 0.5), int(m_y - sp_y + 0.5)),
+    # The portrait sits between the Masked/Unmasked modifiers inside the
+    # inner glow MC (e.g. MC 1000).  Compute the accumulated hierarchy
+    # transform so we can place the portrait in card-root coordinates,
+    # then let the mask state machine clip it automatically.
+    mask_matrix, inner_mc_id = _mask_hierarchy_transform(
+        card_sc, card_obj, _clean_glow_find, glow_label=primary_form,
     )
-    p_arr = np.array(p_scaled)
-    cm_arr = np.array(clip_mask)
-    p_arr[:, :, 3] = (
-        p_arr[:, :, 3].astype(np.int32) * cm_arr.astype(np.int32) // 255
-    ).astype(np.uint8)
-    clipped_portrait = Image.fromarray(p_arr)
+    sp_x = p_x * portrait_scale + mask_matrix.tx
+    sp_y = p_y * portrait_scale + mask_matrix.ty
 
-    # --- Composite everything onto a single canvas ---
-    # Game z-order within MC 1008: notch → glow(additive) → portrait → diamonds.
-    # The glow border sits above the notch but below the portrait; the portrait
-    # covers the glow where it has opaque content.
-    all_parts = (
-        notch_parts
-        + glow_parts
-        + [(clipped_portrait, sp_x, sp_y, 0)]
-        + diamond_parts
+    # Register the portrait for injection into the inner glow MC's mask
+    # group.  _render_object will insert it just before Unmasked, so the
+    # mask clips it and the z-order matches the game automatically.
+    if inner_mc_id is not None:
+        card_sc._inject_in_mask = {
+            inner_mc_id: [(p_scaled, sp_x, sp_y, 0)],
+        }
+
+    # --- Render card in a single pass ---
+    child_labels = {
+        _CARD_CHILD_NOTCH_BASE: primary_form,
+        _CARD_CHILD_GLOW: primary_form,
+        _CARD_CHILD_DIAMOND_RIGHT: primary_form,
+        _CARD_CHILD_DIAMOND_LEFT: secondary_form,
+    }
+    card_parts = card_sc._render_object(
+        card_obj, card_textures, Matrix2x3.IDENTITY, set(),
+        child_labels=child_labels,
     )
+    card_sc._find_frame_by_label = original_find
+    del card_sc._render_children
+    if hasattr(card_sc, "_inject_in_mask"):
+        del card_sc._inject_in_mask
+
+    if not card_parts:
+        return None
+
+    # --- Composite ---
+    all_parts = card_parts
     xmin = min(x for _, x, _, _ in all_parts) - 1
     ymin = min(y for _, _, y, _ in all_parts) - 1
     xmax = max(x + img.width for img, x, _, _ in all_parts) + 1
