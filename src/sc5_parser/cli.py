@@ -49,6 +49,17 @@ def main(argv: list[str] | None = None) -> None:
         "Only listed children are rendered; others are hidden.",
     )
     ap.add_argument(
+        "--frame",
+        type=int,
+        metavar="N",
+        help="Frame index (0-based) to render for the top-level MC",
+    )
+    ap.add_argument(
+        "--all-frames",
+        action="store_true",
+        help="Export every frame of the top-level MC as separate images",
+    )
+    ap.add_argument(
         "--info", action="store_true", help="Show file structure summary"
     )
 
@@ -111,24 +122,67 @@ def _extract(sc: SC5File, args: argparse.Namespace) -> None:
     texture_images = _load_textures(sc, sctx_dir)
 
     child_labels = _parse_child_labels(args.child_labels)
+    frame_index = args.frame
+    all_frames = args.all_frames
 
     names = args.extract if args.extract else list(sc.exports.keys())
 
     extracted = 0
     for name in names:
-        out_path = os.path.join(output_dir, f"{name}.png")
-        result = sc.extract_sprite(
-            name, texture_images, out_path,
-            frame_label=args.frame_label,
-            child_labels=child_labels,
-        )
-        if result:
-            print(f"  Extracted: {name} ({result.width}×{result.height})")
-            extracted += 1
+        if all_frames:
+            extracted += _extract_all_frames(
+                sc, name, texture_images, output_dir,
+                frame_label=args.frame_label,
+                child_labels=child_labels,
+            )
         else:
-            print(f"  Skip: {name} (no visible shapes)")
+            out_path = os.path.join(output_dir, f"{name}.png")
+            result = sc.extract_sprite(
+                name, texture_images, out_path,
+                frame_label=args.frame_label,
+                child_labels=child_labels,
+                frame_index=frame_index,
+            )
+            if result:
+                print(f"  Extracted: {name} ({result.width}×{result.height})")
+                extracted += 1
+            else:
+                print(f"  Skip: {name} (no visible shapes)")
 
     print(f"\nExtracted {extracted}/{len(names)} sprites to {output_dir}")
+
+
+def _extract_all_frames(
+    sc: SC5File,
+    name: str,
+    texture_images: list,
+    output_dir: str,
+    frame_label: str | None = None,
+    child_labels: dict[int, str] | None = None,
+) -> int:
+    """Export every frame of *name* as separate images. Returns count."""
+    info = sc.get_export_frame_info(name)
+    if info is None:
+        print(f"  Skip: {name} (not found or not a movie clip)")
+        return 0
+    count = info["frame_count"]
+    labels = info["frame_labels"]
+    extracted = 0
+    for fi in range(count):
+        label_suffix = f"_{labels[fi]}" if fi < len(labels) and labels[fi] else ""
+        out_path = os.path.join(output_dir, f"{name}_frame{fi}{label_suffix}.png")
+        result = sc.extract_sprite(
+            name, texture_images, out_path,
+            frame_label=frame_label,
+            child_labels=child_labels,
+            frame_index=fi,
+        )
+        if result:
+            print(f"  Frame {fi}{label_suffix}: {name} ({result.width}×{result.height})")
+            extracted += 1
+        else:
+            print(f"  Frame {fi}{label_suffix}: (empty)")
+    return extracted
 
 
 def _parse_child_labels(spec: str | None) -> dict[int, str] | None:

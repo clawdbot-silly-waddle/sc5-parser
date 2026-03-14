@@ -465,6 +465,7 @@ class SC5File:
         depth: int = 0,
         blend_mode: int = 0,
         child_labels: dict[int, str] | None = None,
+        frame_index: int | None = None,
     ) -> list[tuple[Image.Image, float, float, int]]:
         """Recursively render an object (shape or movie clip) with transforms.
 
@@ -475,6 +476,9 @@ class SC5File:
         children.  Only children listed are rendered; others are hidden.
         This is consumed at the first MC level (depth 0) and not propagated
         further — each child uses its assigned label recursively.
+        *frame_index*: if set, use this frame index directly (0-based) for
+        the top-level MC only.  Not propagated to children (they use
+        *frame_label* or their own default).
 
         Returns list of (image, global_x, global_y, blend_mode) tuples ready for final compositing.
         """
@@ -501,9 +505,11 @@ class SC5File:
         if mcd and obj_id not in visited:
             visited.add(obj_id)
 
-            # Pick frame: prefer label match, fall back to 0
+            # Pick frame: frame_index > label match > 0
             frame_idx = 0
-            if frame_label:
+            if frame_index is not None:
+                frame_idx = frame_index
+            elif frame_label:
                 frame_idx = self._find_frame_by_label(obj_id, frame_label)
 
             elements = self._get_frame_elements(obj_id, frame_idx)
@@ -638,6 +644,7 @@ class SC5File:
         output_path: str | Path | None = None,
         frame_label: str | None = None,
         child_labels: dict[int, str] | None = None,
+        frame_index: int | None = None,
     ) -> Image.Image | None:
         """Extract a named sprite, compositing all shapes with correct transforms.
 
@@ -647,6 +654,7 @@ class SC5File:
         children of the export's root MC.  Only children listed in the dict
         are rendered (others are hidden).  Overrides *frame_label* for those
         children; *frame_label* is ignored when *child_labels* is provided.
+        *frame_index*: if set, use this frame index (0-based) for the root MC.
         """
         obj_id = self.exports.get(export_name)
         if obj_id is None:
@@ -656,6 +664,7 @@ class SC5File:
             obj_id, texture_images, Matrix2x3.IDENTITY, set(),
             frame_label=frame_label,
             child_labels=child_labels,
+            frame_index=frame_index,
         )
 
         if not rendered:
@@ -669,6 +678,20 @@ class SC5File:
         if output_path:
             img.save(str(output_path))
         return img
+
+    # ------------------------------------------------------------------
+    def get_export_frame_info(self, export_name: str) -> dict[str, Any] | None:
+        """Return frame count and labels for an export's root MC."""
+        obj_id = self.exports.get(export_name)
+        if obj_id is None:
+            return None
+        mcd = self.movie_clip_data.get(obj_id)
+        if mcd is None:
+            return None
+        return {
+            "frame_count": len(mcd.frame_element_counts),
+            "frame_labels": mcd.frame_labels,
+        }
 
     # ------------------------------------------------------------------
     def get_shape_bounds(self, shape_idx: int) -> dict[str, Any] | None:
