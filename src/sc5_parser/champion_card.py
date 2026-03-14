@@ -67,20 +67,10 @@ _GLOW_CLEAN_FRAME = 29
 # matching the interior of the champion frame border.
 _PORTRAIT_MASK_SHAPE = 392
 
-# The game composites a separate frame export ON TOP of the card base per
-# ``card_forms.toml``.  The export name depends on the card form:
-#   BasicForm  → "card_item_frame"          (MC 974)
-#   HeroForm   → "card_item_frame_hero"     (MC 894)
-#   EvoForm    → "card_item_frame_evolution" 
-_FRAME_EXPORTS: dict[str, str] = {
-    "hero_unlocked": "card_item_frame_hero",
-    "hero_locked": "card_item_frame_hero",
-    "hero_active": "card_item_frame_hero",
-    "evo_unlocked": "card_item_frame_evolution",
-    "evo_locked": "card_item_frame_evolution",
-    "evo_active": "card_item_frame_evolution",
-}
-_FRAME_EXPORT_DEFAULT = "card_item_frame"
+# The game composites a frame border on top of the card base per
+# ``card_forms.toml``.  MC 974 (``card_item_frame``) provides the rounded
+# golden border that matches the in-game reference for champion cards.
+_FRAME_EXPORT = "card_item_frame"
 
 
 # -- Internal helpers -------------------------------------------------------
@@ -194,8 +184,8 @@ def render_champion_card(
     *primary_form*/*secondary_form*: frame labels like ``hero_unlocked``,
     ``evo_unlocked``.  Primary controls the notch, glow, and right-side
     diamond; secondary controls the left-side diamond.  Champion cards are
-    inherently dual-form (champion diamond + form diamond), so both labels
-    default to produce a hero-form champion with purple + gold diamonds.
+    inherently dual-form, so both labels default to produce a dual-form
+    champion with gold (hero_unlocked) and purple (evo_unlocked) diamonds.
 
     Pass ``secondary_form=primary_form`` to force single-form (center
     diamond only).
@@ -253,42 +243,51 @@ def render_champion_card(
         ),
     )
 
-    # --- Render card (all children) then overlay frame on top ----------------
-    # The game composites the frame export ON TOP of the full card MC.
-    # Single form: base + glow + center diamond only.
-    # Dual form:   base + halves + glow + outer diamonds (no center diamond).
-    all_labels: dict[int, str] = {
+    # --- Render card base (notch + glow/portrait) ---------------------------
+    # Split into two passes so the frame overlay sits BETWEEN the base and
+    # diamonds (correct z-order: base → frame → diamonds).
+    base_labels: dict[int, str] = {
         CHILD_NOTCH_BASE: primary_form,
         CHILD_GLOW: primary_form,
     }
     dual = secondary_form != primary_form
     if dual:
-        all_labels[CHILD_NOTCH_RIGHT] = primary_form
-        all_labels[CHILD_NOTCH_LEFT] = secondary_form
-        all_labels[CHILD_DIAMOND_RIGHT] = primary_form
-        all_labels[CHILD_DIAMOND_LEFT] = secondary_form
-    else:
-        all_labels[CHILD_DIAMOND_CENTER] = primary_form
+        base_labels[CHILD_NOTCH_RIGHT] = primary_form
+        base_labels[CHILD_NOTCH_LEFT] = secondary_form
 
-    card_parts = card_sc.render_object(
+    base_parts = card_sc.render_object(
         card_obj, card_textures, Matrix2x3.IDENTITY, set(),
-        child_labels=all_labels,
+        child_labels=base_labels,
         ctx=ctx,
     )
-    if not card_parts:
+    if not base_parts:
         return None
 
-    # --- Frame overlay (separate export composited on top) -----------------
-    frame_export_name = _FRAME_EXPORTS.get(primary_form, _FRAME_EXPORT_DEFAULT)
-    frame_mc_id = card_sc.exports.get(frame_export_name)
+    # --- Frame overlay (between base & diamonds) ----------------------------
+    # MC 974 (card_item_frame) provides the rounded golden border.
     frame_parts: list[tuple[Image.Image, float, float, int]] = []
+    frame_mc_id = card_sc.exports.get(_FRAME_EXPORT)
     if frame_mc_id is not None:
         frame_parts = card_sc.render_object(
             frame_mc_id, card_textures, Matrix2x3.IDENTITY, set(),
         )
 
-    # --- Composite in z-order: card → frame --------------------------------
-    all_parts = card_parts + frame_parts
+    # --- Render diamonds on top --------------------------------------------
+    diamond_labels: dict[int, str] = {}
+    if dual:
+        diamond_labels[CHILD_DIAMOND_RIGHT] = primary_form
+        diamond_labels[CHILD_DIAMOND_LEFT] = secondary_form
+    else:
+        diamond_labels[CHILD_DIAMOND_CENTER] = primary_form
+
+    diamond_parts = card_sc.render_object(
+        card_obj, card_textures, Matrix2x3.IDENTITY, set(),
+        child_labels=diamond_labels,
+        ctx=ctx,
+    )
+
+    # --- Composite in z-order: base → frame → diamonds --------------------
+    all_parts = base_parts + frame_parts + diamond_parts
 
     # --- Composite ---------------------------------------------------------
     xmin = min(x for _, x, _, _ in all_parts) - 1
