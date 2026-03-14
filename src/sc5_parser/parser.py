@@ -84,7 +84,7 @@ class ColorTransform:
                 and self.alpha == 255
                 and self.r_add == 0 and self.g_add == 0 and self.b_add == 0):
             return img
-        arr = np.array(img, dtype=np.int16)
+        arr = np.array(img, dtype=np.int32)
         r, g, b, a = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2], arr[:, :, 3]
         arr[:, :, 0] = np.clip(r * self.r_mul // 255 + self.r_add, 0, 255)
         arr[:, :, 1] = np.clip(g * self.g_mul // 255 + self.g_add, 0, 255)
@@ -537,15 +537,30 @@ class SC5File:
                         if elem.child_index < len(mcd.children_blending)
                         else 0
                     )
-                    # Propagate parent blend: if parent says additive, children inherit
-                    effective_blend = child_blend if child_blend != 0 else blend_mode
 
+                    # Render child with normal compositing internally
                     child_parts = self._render_object(
                         child_id, texture_images, combined, visited,
                         child_color if child_color is not ColorTransform.IDENTITY else color,
                         frame_label, depth + 1,
-                        blend_mode=effective_blend,
+                        blend_mode=0,
                     )
+
+                    # If child has non-zero blend, composite fragments into one image
+                    # first, then apply the blend to the single result
+                    effective_blend = child_blend if child_blend != 0 else blend_mode
+                    if effective_blend != 0 and child_parts and len(child_parts) > 1:
+                        comp = _composite_parts(
+                            [(im, x, y, 0) for im, x, y, _ in child_parts]
+                        )
+                        if comp:
+                            c_img, c_x, c_y = comp
+                            child_parts = [(c_img, c_x, c_y, effective_blend)]
+                        else:
+                            child_parts = []
+                    elif effective_blend != 0 and child_parts:
+                        child_parts = [(im, x, y, effective_blend)
+                                       for im, x, y, _ in child_parts]
 
                     if capture_mask:
                         # Composite this child into a single mask image
@@ -578,11 +593,24 @@ class SC5File:
                         else 0
                     )
                     effective_blend = child_blend if child_blend != 0 else blend_mode
-                    rendered.extend(self._render_object(
+                    child_parts = self._render_object(
                         child_id, texture_images, parent_matrix, visited,
                         color, frame_label, depth + 1,
-                        blend_mode=effective_blend,
-                    ))
+                        blend_mode=0,
+                    )
+                    if effective_blend != 0 and child_parts and len(child_parts) > 1:
+                        comp = _composite_parts(
+                            [(im, x, y, 0) for im, x, y, _ in child_parts]
+                        )
+                        if comp:
+                            c_img, c_x, c_y = comp
+                            child_parts = [(c_img, c_x, c_y, effective_blend)]
+                        else:
+                            child_parts = []
+                    elif effective_blend != 0 and child_parts:
+                        child_parts = [(im, x, y, effective_blend)
+                                       for im, x, y, _ in child_parts]
+                    rendered.extend(child_parts)
             # else: selected frame explicitly has 0 elements — nothing visible
             visited.discard(obj_id)
 
