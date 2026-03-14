@@ -303,7 +303,6 @@ def _auto_sctx(sc_path: str, explicit: str | None) -> str:
 
 def _render_card(args: argparse.Namespace) -> None:
     """Handle the ``render-card`` subcommand."""
-    from PIL import Image
 
     forms = [f.strip() for f in args.forms.split(",")]
     primary = forms[0]
@@ -337,18 +336,13 @@ def _render_card(args: argparse.Namespace) -> None:
         card_sc, card_tex,
         portrait_sc, portrait_tex,
         portrait_scale=args.portrait_scale,
+        render_scale=float(args.zoom),
         **kwargs,
     )
 
     if result is None:
         print("ERROR: Card rendering failed.", file=sys.stderr)
         sys.exit(1)
-
-    if args.zoom > 1:
-        result = result.resize(
-            (result.width * args.zoom, result.height * args.zoom),
-            Image.NEAREST,
-        )
 
     result.save(args.output)
     print(f"Saved: {args.output} ({result.width}×{result.height})")

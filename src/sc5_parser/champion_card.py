@@ -178,6 +178,7 @@ def render_champion_card(
     secondary_form: str = "evo_unlocked",
     portrait_scale: float = 0.55,
     card_export: str = "card_item_image_colored_champion",
+    render_scale: float = 1.0,
 ) -> Image.Image | None:
     """Render a complete champion card with portrait and overlay.
 
@@ -190,14 +191,28 @@ def render_champion_card(
     Pass ``secondary_form=primary_form`` to force single-form (center
     diamond only).
 
+    *render_scale*: multiplier for the output resolution.  At 1.0 shapes
+    are rasterised at native SC coordinates (~130 px wide); higher values
+    produce proportionally larger output via ``_apply_matrix`` BILINEAR
+    resampling, avoiding nearest-neighbour pixelation.
+
     Returns a composited RGBA image or ``None`` on failure.
     """
+    if render_scale <= 0:
+        raise ValueError("render_scale must be positive")
 
     card_obj = card_sc.exports.get(card_export)
     if card_obj is None:
         return None
 
     frame_finder = _make_frame_finder(card_sc)
+
+    # Base matrix: identity scaled by render_scale for higher-res output.
+    base_matrix = (
+        Matrix2x3(a=render_scale, b=0, c=0, d=render_scale, tx=0, ty=0)
+        if render_scale != 1.0
+        else Matrix2x3.IDENTITY
+    )
 
     # --- Render portrait ---------------------------------------------------
     portrait_exports = list(portrait_sc.exports.values())
@@ -219,8 +234,11 @@ def render_champion_card(
         return None
     p_img, p_x, p_y = portrait_result
 
+    # Scale portrait to fit the card at render_scale resolution.
+    effective_portrait_scale = portrait_scale * render_scale
     p_scaled = p_img.resize(
-        (int(p_img.width * portrait_scale), int(p_img.height * portrait_scale)),
+        (int(p_img.width * effective_portrait_scale),
+         int(p_img.height * effective_portrait_scale)),
         Image.LANCZOS,
     )
 
@@ -229,15 +247,16 @@ def render_champion_card(
     mask_matrix, inner_mc_id = _mask_hierarchy_transform(
         card_sc, card_obj, frame_finder, glow_label=primary_form,
     )
-    sp_x = p_x * portrait_scale + mask_matrix.tx
-    sp_y = p_y * portrait_scale + mask_matrix.ty
+    # Portrait position in scaled card-root coordinates.
+    sp_x = p_x * effective_portrait_scale + mask_matrix.tx * render_scale
+    sp_y = p_y * effective_portrait_scale + mask_matrix.ty * render_scale
 
     # --- Frame overlay (rendered separately, injected between glow & diamonds)
     frame_parts: list[tuple[Image.Image, float, float, int]] = []
     frame_mc_id = card_sc.exports.get(_FRAME_EXPORT)
     if frame_mc_id is not None:
         frame_parts = card_sc.render_object(
-            frame_mc_id, card_textures, Matrix2x3.IDENTITY, set(),
+            frame_mc_id, card_textures, base_matrix, set(),
         )
 
     # Build render context: custom frame finder, portrait injection into
@@ -268,7 +287,7 @@ def render_champion_card(
         child_labels[CHILD_DIAMOND_CENTER] = primary_form
 
     card_parts = card_sc.render_object(
-        card_obj, card_textures, Matrix2x3.IDENTITY, set(),
+        card_obj, card_textures, base_matrix, set(),
         child_labels=child_labels,
         ctx=ctx,
     )
