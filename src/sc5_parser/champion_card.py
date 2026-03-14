@@ -63,14 +63,6 @@ CHILD_DIAMOND_LEFT = 6    # MC 1005 @ tx=-18.6
 # no particle/sparkle effects.
 _GLOW_CLEAN_FRAME = 29
 
-# Inner glow MCs (849=evo, 973=hero) include sparkle shapes in every frame.
-# For a static card render we only want child 0 (the frame border shape);
-# sparkle edges create visible artifacts.
-_GLOW_BORDER_ONLY: dict[int, frozenset[int]] = {
-    849: frozenset({0}),
-    973: frozenset({0}),
-}
-
 # Shape 392 is the card portrait clipping mask - a solid rounded rectangle
 # matching the interior of the champion frame border.
 _PORTRAIT_MASK_SHAPE = 392
@@ -229,11 +221,10 @@ def render_champion_card(
     sp_x = p_x * portrait_scale + mask_matrix.tx
     sp_y = p_y * portrait_scale + mask_matrix.ty
 
-    # Build render context: custom frame finder, sparkle suppression,
-    # and portrait injection into the mask group.
+    # Build render context: custom frame finder and portrait injection
+    # into the mask group.
     ctx = RenderContext(
         frame_finder=frame_finder,
-        render_children=_GLOW_BORDER_ONLY,
         inject_in_mask=(
             {inner_mc_id: [(p_scaled, sp_x, sp_y, 0)]}
             if inner_mc_id is not None
