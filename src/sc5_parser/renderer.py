@@ -123,10 +123,23 @@ def render_command(
                 w2 = 1.0 - w0 - w1
 
                 if w0 < -0.01 or w1 < -0.01 or w2 < -0.01:
-                    continue
+                    # Clamp for thin triangles: pixel is within edge
+                    # intersection span but slightly outside in
+                    # barycentric space due to sub-pixel precision.
+                    cw0 = max(0.0, w0)
+                    cw1 = max(0.0, w1)
+                    cw2 = max(0.0, w2)
+                    s = cw0 + cw1 + cw2
+                    if s < 1e-6:
+                        continue
+                    cw0 /= s
+                    cw1 /= s
+                    cw2 /= s
+                else:
+                    cw0, cw1, cw2 = w0, w1, w2
 
-                su = w0 * tu0 + w1 * tu1 + w2 * tu2
-                sv = w0 * tv0 + w1 * tv1 + w2 * tv2
+                su = cw0 * tu0 + cw1 * tu1 + cw2 * tu2
+                sv = cw0 * tv0 + cw1 * tv1 + cw2 * tv2
 
                 tx = max(0, min(tex_w - 1, int(su + 0.5)))
                 ty = max(0, min(tex_h - 1, int(sv + 0.5)))
