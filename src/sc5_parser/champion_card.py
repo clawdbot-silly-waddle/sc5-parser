@@ -49,8 +49,8 @@ from sc5_parser.parser import (
 # -- MC 1008 child indices -------------------------------------------------
 
 CHILD_NOTCH_BASE = 0      # MC 982: full-width notch
-CHILD_NOTCH_RIGHT = 1     # MC 987: right half overlay
-CHILD_NOTCH_LEFT = 2      # MC 988: left half overlay
+CHILD_NOTCH_RIGHT = 1     # MC 987: right half overlay (unused; for reference)
+CHILD_NOTCH_LEFT = 2      # MC 988: left half overlay (unused; for reference)
 CHILD_GLOW = 3            # MC 1001: frame glow border + mask
 CHILD_DIAMOND_CENTER = 4  # MC 1005 (actually "bg_left")
 CHILD_DIAMOND_RIGHT = 5   # MC 1005 @ tx=18.5
@@ -232,39 +232,7 @@ def render_champion_card(
     sp_x = p_x * portrait_scale + mask_matrix.tx
     sp_y = p_y * portrait_scale + mask_matrix.ty
 
-    # Build render context: custom frame finder and portrait injection
-    # into the mask group.
-    ctx = RenderContext(
-        frame_finder=frame_finder,
-        inject_in_mask=(
-            {inner_mc_id: [(p_scaled, sp_x, sp_y, 0)]}
-            if inner_mc_id is not None
-            else None
-        ),
-    )
-
-    # --- Render card base (notch + glow/portrait) ---------------------------
-    # Split into two passes so the frame overlay sits BETWEEN the base and
-    # diamonds (correct z-order: base → frame → diamonds).
-    base_labels: dict[int, str] = {
-        CHILD_NOTCH_BASE: primary_form,
-        CHILD_GLOW: primary_form,
-    }
-    dual = secondary_form != primary_form
-    if dual:
-        base_labels[CHILD_NOTCH_RIGHT] = primary_form
-        base_labels[CHILD_NOTCH_LEFT] = secondary_form
-
-    base_parts = card_sc.render_object(
-        card_obj, card_textures, Matrix2x3.IDENTITY, set(),
-        child_labels=base_labels,
-        ctx=ctx,
-    )
-    if not base_parts:
-        return None
-
-    # --- Frame overlay (between base & diamonds) ----------------------------
-    # MC 974 (card_item_frame) provides the rounded golden border.
+    # --- Frame overlay (rendered separately, injected between glow & diamonds)
     frame_parts: list[tuple[Image.Image, float, float, int]] = []
     frame_mc_id = card_sc.exports.get(_FRAME_EXPORT)
     if frame_mc_id is not None:
@@ -272,34 +240,52 @@ def render_champion_card(
             frame_mc_id, card_textures, Matrix2x3.IDENTITY, set(),
         )
 
-    # --- Render diamonds on top --------------------------------------------
-    diamond_labels: dict[int, str] = {}
-    if dual:
-        diamond_labels[CHILD_DIAMOND_RIGHT] = primary_form
-        diamond_labels[CHILD_DIAMOND_LEFT] = secondary_form
-    else:
-        diamond_labels[CHILD_DIAMOND_CENTER] = primary_form
-
-    diamond_parts = card_sc.render_object(
-        card_obj, card_textures, Matrix2x3.IDENTITY, set(),
-        child_labels=diamond_labels,
-        ctx=ctx,
+    # Build render context: custom frame finder, portrait injection into
+    # the mask group, and frame overlay after the glow child.
+    ctx = RenderContext(
+        frame_finder=frame_finder,
+        inject_in_mask=(
+            {inner_mc_id: [(p_scaled, sp_x, sp_y, 0)]}
+            if inner_mc_id is not None
+            else None
+        ),
+        overlay_after_child={CHILD_GLOW: frame_parts} if frame_parts else None,
     )
 
-    # --- Composite in z-order: base → frame → diamonds --------------------
-    all_parts = base_parts + frame_parts + diamond_parts
+    # --- Render card (single pass) -----------------------------------------
+    # MC 1008's natural child order determines z-order:
+    #   notch (0) -> glow+portrait (3) -> [frame overlay] -> diamonds (4-6)
+    # Only the base notch is shown (not halves); diamonds use form labels.
+    child_labels: dict[int, str] = {
+        CHILD_NOTCH_BASE: primary_form,
+        CHILD_GLOW: primary_form,
+    }
+    dual = secondary_form != primary_form
+    if dual:
+        child_labels[CHILD_DIAMOND_RIGHT] = primary_form
+        child_labels[CHILD_DIAMOND_LEFT] = secondary_form
+    else:
+        child_labels[CHILD_DIAMOND_CENTER] = primary_form
+
+    card_parts = card_sc.render_object(
+        card_obj, card_textures, Matrix2x3.IDENTITY, set(),
+        child_labels=child_labels,
+        ctx=ctx,
+    )
+    if not card_parts:
+        return None
 
     # --- Composite ---------------------------------------------------------
-    xmin = min(x for _, x, _, _ in all_parts) - 1
-    ymin = min(y for _, _, y, _ in all_parts) - 1
-    xmax = max(x + img.width for img, x, _, _ in all_parts) + 1
-    ymax = max(y + img.height for img, _, y, _ in all_parts) + 1
+    xmin = min(x for _, x, _, _ in card_parts) - 1
+    ymin = min(y for _, _, y, _ in card_parts) - 1
+    xmax = max(x + img.width for img, x, _, _ in card_parts) + 1
+    ymax = max(y + img.height for img, _, y, _ in card_parts) + 1
     cw = int(xmax - xmin + 0.5)
     ch = int(ymax - ymin + 0.5)
 
     canvas = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
 
-    for img, xo, yo, blend in all_parts:
+    for img, xo, yo, blend in card_parts:
         px = int(xo - xmin + 0.5)
         py = int(yo - ymin + 0.5)
         if blend == 8:

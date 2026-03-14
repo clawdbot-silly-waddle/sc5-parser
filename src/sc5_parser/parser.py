@@ -139,6 +139,12 @@ class RenderContext:
     lists of ``(image, x, y, blend_mode)`` tuples that get composited
     into the mask group at the MASKED modifier boundary."""
 
+    overlay_after_child: dict[int, list[tuple[Image.Image, float, float, int]]] | None = None
+    """Extra parts to insert after a specific child index during top-level
+    MC rendering.  Keys are child indices; values are lists of
+    ``(image, x, y, blend_mode)`` tuples.  Only consumed at depth 0 of
+    the root ``render_object`` call (same scope as *child_labels*)."""
+
 
 class SC5File:
     """Parsed representation of an SC v5 file."""
@@ -665,6 +671,18 @@ class SC5File:
                                 rendered.append((c_img, c_x, c_y, cp_blend))
                     else:
                         rendered.extend(child_parts)
+
+                    # Inject overlay parts after this child (depth 0 only).
+                    # Overlays are not subject to the mask state machine
+                    # because they represent independent content (e.g. a
+                    # frame border) composited at this z-position.
+                    if (depth == 0
+                            and ctx is not None
+                            and ctx.overlay_after_child is not None
+                            and elem.child_index in ctx.overlay_after_child):
+                        rendered.extend(
+                            ctx.overlay_after_child[elem.child_index]
+                        )
             elif mcd.frame_elements_offset == 0xFFFFFFFF:
                 # No frame element data at all - render children with identity
                 for idx, child_id in enumerate(mcd.children_ids):
