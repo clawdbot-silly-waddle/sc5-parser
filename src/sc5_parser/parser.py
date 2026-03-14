@@ -515,6 +515,14 @@ class SC5File:
             elements = self._get_frame_elements(obj_id, frame_idx)
 
             if elements:
+                # Optionally limit which children are rendered (e.g.
+                # to suppress sparkle shapes from glow MCs).
+                _render_children = getattr(self, '_render_children', None)
+                allowed_children = (
+                    _render_children.get(obj_id)
+                    if _render_children else None
+                )
+
                 # Mask state machine for MovieClipModifiers
                 mask_img: Image.Image | None = None
                 mask_x: float = 0
@@ -524,6 +532,8 @@ class SC5File:
 
                 for elem in elements:
                     if elem.child_index >= len(mcd.children_ids):
+                        continue
+                    if allowed_children is not None and elem.child_index not in allowed_children:
                         continue
                     child_id = mcd.children_ids[elem.child_index]
 
@@ -951,6 +961,14 @@ _CARD_CHILD_DIAMOND_LEFT = 6  # MC 1005 @ tx=-18.6
 # with just the outline shape and clipping mask (no particle effects).
 _GLOW_CLEAN_FRAME = 33
 
+# Inner glow MCs (849=evo, 973=hero) always include sparkle shapes in
+# every frame.  For a static card render we only want child 0 (the frame
+# border Shape 397) — sparkle edges create visible artifacts.
+_GLOW_BORDER_ONLY: dict[int, frozenset[int]] = {
+    849: frozenset({0}),
+    973: frozenset({0}),
+}
+
 # Shape 392 is the card portrait clipping mask — a solid rounded rectangle
 # matching the interior of the champion frame border.
 _CARD_PORTRAIT_MASK_SHAPE = 392
@@ -1052,10 +1070,12 @@ def render_champion_card(
         return 0
 
     card_sc._find_frame_by_label = _clean_glow_find
+    card_sc._render_children = _GLOW_BORDER_ONLY  # suppress sparkles
 
     card_obj = card_sc.exports.get(card_export)
     if card_obj is None:
         card_sc._find_frame_by_label = original_find
+        del card_sc._render_children
         return None
 
     child_labels = {
@@ -1070,6 +1090,7 @@ def render_champion_card(
         child_labels=child_labels,
     )
     card_sc._find_frame_by_label = original_find
+    del card_sc._render_children
 
     if not card_parts:
         return None
@@ -1116,6 +1137,14 @@ def render_champion_card(
         Image.LANCZOS,
     )
     sp_x, sp_y = p_x * portrait_scale, p_y * portrait_scale
+
+    # In the game the portrait is placed between the Masked / Unmasked
+    # modifiers inside the inner glow MC (1000).  Its local origin sits
+    # at MC 1000's (0,0), which is offset from the card root by the same
+    # accumulated hierarchy transform that reaches Shape 392.  Apply that
+    # transform so the portrait and mask share the same coordinate origin.
+    sp_x += mask_matrix.tx
+    sp_y += mask_matrix.ty
 
     clip_mask = Image.new("L", p_scaled.size, 0)
     clip_mask.paste(

@@ -65,6 +65,10 @@ def render_command(
 
     tex_arr = np.array(tex_img)
     out_arr = np.zeros((out_h, out_w, 4), dtype=np.uint8)
+    # Track which pixels were rendered by a triangle that solidly
+    # contains them (all barycentric weights >= 0).  Clamped pixels
+    # (from an adjacent triangle's edge) must not overwrite these.
+    filled = np.zeros((out_h, out_w), dtype=np.bool_)
 
     for i0, i1, i2 in triangulate_strip(len(cmd_verts)):
         x0, y0, u0_raw, v0_raw = cmd_verts[i0]
@@ -123,9 +127,13 @@ def render_command(
                 w2 = 1.0 - w0 - w1
 
                 if w0 < -0.01 or w1 < -0.01 or w2 < -0.01:
-                    # Clamp for thin triangles: pixel is within edge
-                    # intersection span but slightly outside in
-                    # barycentric space due to sub-pixel precision.
+                    # Pixel is within edge-intersection span but
+                    # outside in barycentric space — clamp for thin
+                    # triangles that need gap-filling, but never
+                    # overwrite a pixel already rendered solidly by
+                    # the adjacent triangle (avoids UV seam).
+                    if filled[py, px]:
+                        continue
                     cw0 = max(0.0, w0)
                     cw1 = max(0.0, w1)
                     cw2 = max(0.0, w2)
@@ -137,6 +145,7 @@ def render_command(
                     cw2 /= s
                 else:
                     cw0, cw1, cw2 = w0, w1, w2
+                    filled[py, px] = True
 
                 su = cw0 * tu0 + cw1 * tu1 + cw2 * tu2
                 sv = cw0 * tv0 + cw1 * tv1 + cw2 * tv2
