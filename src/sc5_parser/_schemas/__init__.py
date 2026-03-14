@@ -1,4 +1,4 @@
-"""Generated FlatBuffer schemas — add this directory to sys.path for imports."""
+"""Generated FlatBuffer schemas - add this directory to sys.path for imports."""
 import sys
 from pathlib import Path
 

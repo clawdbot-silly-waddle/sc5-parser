@@ -173,7 +173,7 @@ def _print_exports(sc: SC5File) -> None:
                 regions.append(f"{b['width']:.0f}×{b['height']:.0f}")
         print(
             f"  {name}  (id={mc_id}, shapes={len(shapes)}, "
-            f"regions={', '.join(regions) or '—'})"
+            f"regions={', '.join(regions) or '-'})"
         )
 
 

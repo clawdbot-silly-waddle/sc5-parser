@@ -39,40 +39,27 @@ MovieClips can have named frames (state selectors). Use `--frame-label` to
 select a frame by name for all child MCs recursively:
 
 ```bash
-# All children use "hero_unlocked" frame
-sc5-parser ui_card_items.sc --extract card_item_image_colored_champion \
+sc5-parser ui_card_items.sc --extract some_export \
   --frame-label hero_unlocked -o sprites/
 ```
 
 ### Per-Child Frame Labels
 
-For multi-form sprites (e.g. champion cards with both evo and hero states),
-use `--child-labels` to assign individual frame labels to direct children of
+Use `--child-labels` to assign individual frame labels to direct children of
 the top-level MC. Only children listed are rendered; others are hidden.
 
 ```bash
-# Champion card with hero base + evo left half + center diamond
-sc5-parser ui_card_items.sc --extract card_item_image_colored_champion \
+sc5-parser ui_card_items.sc --extract some_export \
   --child-labels "0:hero_unlocked,4:evo_unlocked" -o sprites/
 ```
 
 Format: `INDEX:LABEL,INDEX:LABEL,...` where INDEX is the child position in
 the MC's children array.
 
-### Champion Card Rendering
+### Subcommands
 
-The `render-card` subcommand composites a champion card with portrait:
-
-```bash
-sc5-parser render-card \
-  --card-sc ui_card_items.sc \
-  --portrait-sc ui_card_knight_hero.sc \
-  --forms hero_unlocked \
-  --zoom 4 \
-  -o card.png
-```
-
-See `champion_card.py` for the full structure documentation.
+The `render-card` subcommand composites a champion card with portrait.
+See `sc5_parser/champion_card.py` for details.
 
 ## SC v5 File Format
 
@@ -113,7 +100,7 @@ coordinates normalised to 0–65535.
   modes exist but are rarely used. Additive blending requires compositing
   child fragments into an intermediate image first.
 - **Masking**: MovieClipModifiers (types 38/39/40) implement a mask state
-  machine — the mask child's alpha clips subsequent masked children.
+  machine - the mask child's alpha clips subsequent masked children.
 
 ## FlatBuffer Schemas
 

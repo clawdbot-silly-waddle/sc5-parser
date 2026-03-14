@@ -45,7 +45,7 @@ def render_command(
 
     Returns
     -------
-    ``(image, x_offset, y_offset)`` — the rendered sprite fragment and
+    ``(image, x_offset, y_offset)`` - the rendered sprite fragment and
     its position relative to the shape's local origin.  Returns
     ``(None, 0, 0)`` when rendering is impossible.
     """
@@ -128,7 +128,7 @@ def render_command(
 
                 if w0 < -0.01 or w1 < -0.01 or w2 < -0.01:
                     # Pixel is within edge-intersection span but
-                    # outside in barycentric space — clamp for thin
+                    # outside in barycentric space - clamp for thin
                     # triangles that need gap-filling, but never
                     # overwrite a pixel already rendered solidly by
                     # the adjacent triangle (avoids UV seam).

@@ -499,7 +499,7 @@ class SC5File:
         *child_labels*: if set, maps child_index → frame_label for direct
         children.  Only children listed are rendered; others are hidden.
         This is consumed at the first MC level (depth 0) and not propagated
-        further — each child uses its assigned label recursively.
+        further - each child uses its assigned label recursively.
         *ctx*: optional render context for custom frame selection, child
         filtering, and mask content injection.
         *frame_index*: if set, use this frame index directly (0-based) for
@@ -663,7 +663,7 @@ class SC5File:
                     else:
                         rendered.extend(child_parts)
             elif mcd.frame_elements_offset == 0xFFFFFFFF:
-                # No frame element data at all — render children with identity
+                # No frame element data at all - render children with identity
                 for idx, child_id in enumerate(mcd.children_ids):
                     child_blend = (
                         mcd.children_blending[idx]
@@ -690,7 +690,7 @@ class SC5File:
                         child_parts = [(im, x, y, effective_blend)
                                        for im, x, y, _ in child_parts]
                     rendered.extend(child_parts)
-            # else: selected frame explicitly has 0 elements — nothing visible
+            # else: selected frame explicitly has 0 elements - nothing visible
             visited.discard(obj_id)
 
         return rendered
@@ -751,7 +751,7 @@ class SC5File:
     ) -> tuple[Image.Image, float, float] | None:
         """Like extract_sprite but returns (image, x_offset, y_offset).
 
-        The offsets are in game coordinates (origin = center of card).
+        The offsets are in game coordinates (relative to the object origin).
         Multiple exports placed at their offsets will naturally overlay.
         """
         obj_id = self.exports.get(export_name)
@@ -868,7 +868,7 @@ def _apply_matrix(
     Returns (transformed_image, new_x, new_y) in the parent coordinate space.
     """
     if mat.a == 1 and mat.b == 0 and mat.c == 0 and mat.d == 1:
-        # Pure translation — skip expensive affine transform
+        # Pure translation - skip expensive affine transform
         return img, x_off + mat.tx, y_off + mat.ty
 
     w, h = img.size

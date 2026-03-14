@@ -2,23 +2,23 @@
 
 Renders a complete champion card image by compositing a portrait into the
 card frame overlay from ``ui_card_items.sc``.  This module is a *consumer*
-of the ``sc5_parser`` library — it uses only the public API.
+of the ``sc5_parser`` library - it uses only the public API.
 
 Champion Card Structure (MC 1008 ``card_item_image_colored_champion``)
 ----------------------------------------------------------------------
 
 ::
 
-    child[0] MC 982  "hero_activate_anim"  — full-width base notch (99px)
-    child[1] MC 987  "bg_full"             — right half overlay (50px)
-    child[2] MC 988  "bg_right"            — left half overlay (50px)
-    child[3] MC 1001 "evo_glow"            — glow effect
-    child[4] MC 1005 "bg_left"             — CENTER diamond slot
-    child[5] MC 1005 "diamond_center"      — RIGHT diamond slot
-    child[6] MC 1005 "diamond_right"       — LEFT diamond slot
-    child[7] MC 572  "frame_anim"          — animation (empty)
+    child[0] MC 982  "hero_activate_anim"  - full-width base notch (99px)
+    child[1] MC 987  "bg_full"             - right half overlay (50px)
+    child[2] MC 988  "bg_right"            - left half overlay (50px)
+    child[3] MC 1001 "evo_glow"            - glow effect
+    child[4] MC 1005 "bg_left"             - CENTER diamond slot
+    child[5] MC 1005 "diamond_center"      - RIGHT diamond slot
+    child[6] MC 1005 "diamond_right"       - LEFT diamond slot
+    child[7] MC 572  "frame_anim"          - animation (empty)
 
-**NOTE**: Instance names don't match positions — "bg_left" is actually the
+**NOTE**: Instance names don't match positions - "bg_left" is actually the
 center diamond, "diamond_center" is the right one, etc.
 
 Rendering rules
@@ -64,14 +64,14 @@ CHILD_DIAMOND_LEFT = 6    # MC 1005 @ tx=-18.6
 _GLOW_CLEAN_FRAME = 29
 
 # Inner glow MCs (849=evo, 973=hero) include sparkle shapes in every frame.
-# For a static card render we only want child 0 (the frame border shape) —
+# For a static card render we only want child 0 (the frame border shape);
 # sparkle edges create visible artifacts.
 _GLOW_BORDER_ONLY: dict[int, frozenset[int]] = {
     849: frozenset({0}),
     973: frozenset({0}),
 }
 
-# Shape 392 is the card portrait clipping mask — a solid rounded rectangle
+# Shape 392 is the card portrait clipping mask - a solid rounded rectangle
 # matching the interior of the champion frame border.
 _PORTRAIT_MASK_SHAPE = 392
 
