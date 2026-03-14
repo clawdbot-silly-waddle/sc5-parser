@@ -29,8 +29,7 @@ def decode_sctx(sctx_path: str) -> Image.Image:
     header_len = struct.unpack("<I", streaming_data[sd_off : sd_off + 4])[0]
     sd_off += 4
     sd_off += header_len
-    _pixel_type = struct.unpack("<I", streaming_data[sd_off : sd_off + 4])[0]
-    sd_off += 4
+    sd_off += 4  # skip pixel_type (we decode ASTC unconditionally)
     width = struct.unpack("<H", streaming_data[sd_off : sd_off + 2])[0]
     sd_off += 2
     height = struct.unpack("<H", streaming_data[sd_off : sd_off + 2])[0]
