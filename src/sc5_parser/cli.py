@@ -42,6 +42,13 @@ def main(argv: list[str] | None = None) -> None:
         "(e.g. evo_unlocked, hero_unlocked)",
     )
     ap.add_argument(
+        "--child-labels",
+        metavar="SPEC",
+        help="Per-child frame labels for the top-level MC. Format: "
+        '"INDEX:LABEL,INDEX:LABEL,..." e.g. "0:hero_unlocked,4:evo_unlocked". '
+        "Only listed children are rendered; others are hidden.",
+    )
+    ap.add_argument(
         "--info", action="store_true", help="Show file structure summary"
     )
 
@@ -103,6 +110,8 @@ def _extract(sc: SC5File, args: argparse.Namespace) -> None:
 
     texture_images = _load_textures(sc, sctx_dir)
 
+    child_labels = _parse_child_labels(args.child_labels)
+
     names = args.extract if args.extract else list(sc.exports.keys())
 
     extracted = 0
@@ -111,6 +120,7 @@ def _extract(sc: SC5File, args: argparse.Namespace) -> None:
         result = sc.extract_sprite(
             name, texture_images, out_path,
             frame_label=args.frame_label,
+            child_labels=child_labels,
         )
         if result:
             print(f"  Extracted: {name} ({result.width}×{result.height})")
@@ -119,6 +129,30 @@ def _extract(sc: SC5File, args: argparse.Namespace) -> None:
             print(f"  Skip: {name} (no visible shapes)")
 
     print(f"\nExtracted {extracted}/{len(names)} sprites to {output_dir}")
+
+
+def _parse_child_labels(spec: str | None) -> dict[int, str] | None:
+    """Parse ``"0:label_a,4:label_b"`` into ``{0: 'label_a', 4: 'label_b'}``."""
+    if not spec:
+        return None
+    result: dict[int, str] = {}
+    for pair in spec.split(","):
+        pair = pair.strip()
+        if ":" not in pair:
+            print(
+                f"WARNING: bad child-label pair '{pair}' (expected INDEX:LABEL)",
+                file=sys.stderr,
+            )
+            continue
+        idx_str, label = pair.split(":", 1)
+        try:
+            result[int(idx_str)] = label
+        except ValueError:
+            print(
+                f"WARNING: bad child index '{idx_str}' in child-labels",
+                file=sys.stderr,
+            )
+    return result or None
 
 
 def _load_textures(sc: SC5File, sctx_dir: str) -> list:

@@ -464,12 +464,17 @@ class SC5File:
         frame_label: str | None = None,
         depth: int = 0,
         blend_mode: int = 0,
+        child_labels: dict[int, str] | None = None,
     ) -> list[tuple[Image.Image, float, float, int]]:
         """Recursively render an object (shape or movie clip) with transforms.
 
         *frame_label*: if set, child MCs that have a frame with this label
         will render that frame instead of frame 0.
         *blend_mode*: 0=normal, 8=add (additive blending).
+        *child_labels*: if set, maps child_index → frame_label for direct
+        children.  Only children listed are rendered; others are hidden.
+        This is consumed at the first MC level (depth 0) and not propagated
+        further — each child uses its assigned label recursively.
 
         Returns list of (image, global_x, global_y, blend_mode) tuples ready for final compositing.
         """
@@ -529,6 +534,15 @@ class SC5File:
                         mask_img = None
                         continue
 
+                    # Per-child label override: only render listed
+                    # children, each with its own label.
+                    if child_labels is not None:
+                        if elem.child_index not in child_labels:
+                            continue
+                        effective_label = child_labels[elem.child_index]
+                    else:
+                        effective_label = frame_label
+
                     child_mat = self._get_matrix(obj_id, elem.matrix_index)
                     child_color = self._get_color(obj_id, elem.color_index)
                     combined = parent_matrix @ child_mat
@@ -542,7 +556,7 @@ class SC5File:
                     child_parts = self._render_object(
                         child_id, texture_images, combined, visited,
                         child_color if child_color is not ColorTransform.IDENTITY else color,
-                        frame_label, depth + 1,
+                        effective_label, depth + 1,
                         blend_mode=0,
                     )
 
@@ -623,11 +637,16 @@ class SC5File:
         texture_images: list[Image.Image | None],
         output_path: str | Path | None = None,
         frame_label: str | None = None,
+        child_labels: dict[int, str] | None = None,
     ) -> Image.Image | None:
         """Extract a named sprite, compositing all shapes with correct transforms.
 
         *frame_label*: if set, child MCs select the frame matching this label
         (e.g. "evo_unlocked") instead of frame 0.
+        *child_labels*: if set, maps child_index → frame_label for direct
+        children of the export's root MC.  Only children listed in the dict
+        are rendered (others are hidden).  Overrides *frame_label* for those
+        children; *frame_label* is ignored when *child_labels* is provided.
         """
         obj_id = self.exports.get(export_name)
         if obj_id is None:
@@ -636,6 +655,7 @@ class SC5File:
         rendered = self._render_object(
             obj_id, texture_images, Matrix2x3.IDENTITY, set(),
             frame_label=frame_label,
+            child_labels=child_labels,
         )
 
         if not rendered:
