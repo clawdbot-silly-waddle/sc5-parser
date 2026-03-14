@@ -1038,8 +1038,10 @@ def render_champion_card(
         mcd = card_sc.movie_clip_data.get(mc_id)
         if mcd is None:
             return 0
+        # Champion cards use the hero_unlocked glow variant
+        effective = "hero_unlocked" if label == "champion" and mc_id == 1001 else label
         for i, fl in enumerate(mcd.frame_labels):
-            if fl == label:
+            if fl == effective:
                 return i
         # Glow sub-MCs: use clean frame (border only, no particle clouds)
         if mc_id in (990, 1000):
