@@ -1159,7 +1159,12 @@ def render_champion_card(
     clipped_portrait = Image.fromarray(p_arr)
 
     # --- Composite everything onto a single canvas ---
-    all_parts = [(clipped_portrait, sp_x, sp_y, 0)] + card_parts
+    # In the game, the glow (blend=8) renders BEFORE the portrait in
+    # MC 1000's hierarchy, so the portrait covers the glow where it has
+    # content.  Put additive parts first, then portrait, then normal parts.
+    glow_parts = [(im, x, y, b) for im, x, y, b in card_parts if b != 0]
+    front_parts = [(im, x, y, b) for im, x, y, b in card_parts if b == 0]
+    all_parts = glow_parts + [(clipped_portrait, sp_x, sp_y, 0)] + front_parts
     xmin = min(x for _, x, _, _ in all_parts) - 1
     ymin = min(y for _, _, y, _ in all_parts) - 1
     xmax = max(x + img.width for img, x, _, _ in all_parts) + 1
