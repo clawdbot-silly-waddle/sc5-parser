@@ -529,7 +529,10 @@ class SC5File:
         # If it's a movie clip, process frame elements
         mcd = self.movie_clip_data.get(obj_id)
         if mcd and obj_id not in visited:
-            visited.add(obj_id)
+            # Branch-scoped visited: siblings may reference the same MC
+            # (e.g. three MC 1005 diamond children with different labels)
+            # so we must NOT mutate the caller's set.
+            child_visited = visited | {obj_id}
 
             # Pick frame: frame_index > ctx.frame_finder > label match > 0
             frame_idx = 0
@@ -617,7 +620,7 @@ class SC5File:
 
                     # Render child with normal compositing internally
                     child_parts = self.render_object(
-                        child_id, texture_images, combined, visited,
+                        child_id, texture_images, combined, child_visited,
                         child_color if child_color is not ColorTransform.IDENTITY else color,
                         effective_label, depth + 1,
                         blend_mode=0,
@@ -672,7 +675,7 @@ class SC5File:
                     )
                     effective_blend = child_blend if child_blend != 0 else blend_mode
                     child_parts = self.render_object(
-                        child_id, texture_images, parent_matrix, visited,
+                        child_id, texture_images, parent_matrix, child_visited,
                         color, frame_label, depth + 1,
                         blend_mode=0,
                         ctx=ctx,
@@ -691,7 +694,6 @@ class SC5File:
                                        for im, x, y, _ in child_parts]
                     rendered.extend(child_parts)
             # else: selected frame explicitly has 0 elements - nothing visible
-            visited.discard(obj_id)
 
         return rendered
 

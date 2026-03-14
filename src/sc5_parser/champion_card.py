@@ -67,6 +67,21 @@ _GLOW_CLEAN_FRAME = 29
 # matching the interior of the champion frame border.
 _PORTRAIT_MASK_SHAPE = 392
 
+# The game composites a separate frame export ON TOP of the card base per
+# ``card_forms.toml``.  The export name depends on the card form:
+#   BasicForm  → "card_item_frame"          (MC 974)
+#   HeroForm   → "card_item_frame_hero"     (MC 894)
+#   EvoForm    → "card_item_frame_evolution" 
+_FRAME_EXPORTS: dict[str, str] = {
+    "hero_unlocked": "card_item_frame_hero",
+    "hero_locked": "card_item_frame_hero",
+    "hero_active": "card_item_frame_hero",
+    "evo_unlocked": "card_item_frame_evolution",
+    "evo_locked": "card_item_frame_evolution",
+    "evo_active": "card_item_frame_evolution",
+}
+_FRAME_EXPORT_DEFAULT = "card_item_frame"
+
 
 # -- Internal helpers -------------------------------------------------------
 
@@ -125,6 +140,8 @@ def _mask_hierarchy_transform(
     glow_mc_id: int | None = None
     for elem in card_fe:
         if elem.child_index == CHILD_GLOW:
+            if CHILD_GLOW >= len(card_mcd.children_ids):
+                return result, None
             result = result @ card_sc.get_matrix(card_mc_id, elem.matrix_index)
             glow_mc_id = card_mcd.children_ids[CHILD_GLOW]
             break
@@ -138,6 +155,8 @@ def _mask_hierarchy_transform(
     glow_frame = frame_finder(glow_mc_id, glow_label)
     glow_fe = card_sc.get_frame_elements(glow_mc_id, glow_frame)
     if not glow_fe:
+        return result, None
+    if glow_fe[0].child_index >= len(glow_mcd.children_ids):
         return result, None
     result = result @ card_sc.get_matrix(glow_mc_id, glow_fe[0].matrix_index)
     inner_mc_id = glow_mcd.children_ids[glow_fe[0].child_index]
@@ -232,33 +251,54 @@ def render_champion_card(
         ),
     )
 
-    # --- Render card in a single pass --------------------------------------
-    child_labels = {
+    # --- Render card (all children) then overlay frame on top ----------------
+    # The game composites the frame export ON TOP of the full card MC.
+    # Single form: base + glow + center diamond only.
+    # Dual form:   base + halves + glow + outer diamonds (no center diamond).
+    all_labels: dict[int, str] = {
         CHILD_NOTCH_BASE: primary_form,
         CHILD_GLOW: primary_form,
-        CHILD_DIAMOND_RIGHT: primary_form,
-        CHILD_DIAMOND_LEFT: secondary_form,
     }
+    dual = secondary_form != primary_form
+    if dual:
+        all_labels[CHILD_NOTCH_RIGHT] = primary_form
+        all_labels[CHILD_NOTCH_LEFT] = secondary_form
+        all_labels[CHILD_DIAMOND_RIGHT] = primary_form
+        all_labels[CHILD_DIAMOND_LEFT] = secondary_form
+    else:
+        all_labels[CHILD_DIAMOND_CENTER] = primary_form
+
     card_parts = card_sc.render_object(
         card_obj, card_textures, Matrix2x3.IDENTITY, set(),
-        child_labels=child_labels,
+        child_labels=all_labels,
         ctx=ctx,
     )
-
     if not card_parts:
         return None
 
+    # --- Frame overlay (separate export composited on top) -----------------
+    frame_export_name = _FRAME_EXPORTS.get(primary_form, _FRAME_EXPORT_DEFAULT)
+    frame_mc_id = card_sc.exports.get(frame_export_name)
+    frame_parts: list[tuple[Image.Image, float, float, int]] = []
+    if frame_mc_id is not None:
+        frame_parts = card_sc.render_object(
+            frame_mc_id, card_textures, Matrix2x3.IDENTITY, set(),
+        )
+
+    # --- Composite in z-order: card → frame --------------------------------
+    all_parts = card_parts + frame_parts
+
     # --- Composite ---------------------------------------------------------
-    xmin = min(x for _, x, _, _ in card_parts) - 1
-    ymin = min(y for _, _, y, _ in card_parts) - 1
-    xmax = max(x + img.width for img, x, _, _ in card_parts) + 1
-    ymax = max(y + img.height for img, _, y, _ in card_parts) + 1
+    xmin = min(x for _, x, _, _ in all_parts) - 1
+    ymin = min(y for _, _, y, _ in all_parts) - 1
+    xmax = max(x + img.width for img, x, _, _ in all_parts) + 1
+    ymax = max(y + img.height for img, _, y, _ in all_parts) + 1
     cw = int(xmax - xmin + 0.5)
     ch = int(ymax - ymin + 0.5)
 
     canvas = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
 
-    for img, xo, yo, blend in card_parts:
+    for img, xo, yo, blend in all_parts:
         px = int(xo - xmin + 0.5)
         py = int(yo - ymin + 0.5)
         if blend == 8:
