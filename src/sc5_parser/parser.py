@@ -951,6 +951,10 @@ _CARD_CHILD_DIAMOND_LEFT = 6  # MC 1005 @ tx=-18.6
 # with just the outline shape and clipping mask (no particle effects).
 _GLOW_CLEAN_FRAME = 33
 
+# Shape 392 is the card portrait clipping mask — a solid rounded rectangle
+# matching the interior of the champion frame border.
+_CARD_PORTRAIT_MASK_SHAPE = 392
+
 
 def render_champion_card(
     card_sc: SC5File,
@@ -961,7 +965,6 @@ def render_champion_card(
     secondary_form: str | None = None,
     portrait_scale: float = 0.55,
     card_export: str = "card_item_image_colored_champion",
-    mask_export: str = "card_mask_champion",
 ) -> Image.Image | None:
     """Render a complete champion card with portrait and overlay.
 
@@ -1037,12 +1040,17 @@ def render_champion_card(
     p_img, p_x, p_y = portrait_result
 
     # --- Scale and clip portrait to card mask ---
-    mask_result = card_sc.extract_sprite_with_offset(mask_export, card_textures)
+    mask_parts = card_sc._render_object(
+        _CARD_PORTRAIT_MASK_SHAPE, card_textures, Matrix2x3.IDENTITY, set(),
+    )
+    if not mask_parts:
+        return None
+    mask_result = _composite_parts(mask_parts)
     if mask_result is None:
         return None
     m_img, m_x, m_y = mask_result
     m_alpha = np.array(m_img)[:, :, 3]
-    m_binary = np.where(m_alpha > m_alpha.max() // 2, 255, 0).astype(np.uint8)
+    m_binary = np.where(m_alpha > 0, 255, 0).astype(np.uint8)
 
     p_scaled = p_img.resize(
         (int(p_img.width * portrait_scale), int(p_img.height * portrait_scale)),
