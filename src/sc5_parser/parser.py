@@ -679,6 +679,35 @@ class SC5File:
             img.save(str(output_path))
         return img
 
+    def extract_sprite_with_offset(
+        self,
+        export_name: str,
+        texture_images: list[Image.Image | None],
+        frame_label: str | None = None,
+        child_labels: dict[int, str] | None = None,
+        frame_index: int | None = None,
+    ) -> tuple[Image.Image, float, float] | None:
+        """Like extract_sprite but returns (image, x_offset, y_offset).
+
+        The offsets are in game coordinates (origin = center of card).
+        Multiple exports placed at their offsets will naturally overlay.
+        """
+        obj_id = self.exports.get(export_name)
+        if obj_id is None:
+            return None
+
+        rendered = self._render_object(
+            obj_id, texture_images, Matrix2x3.IDENTITY, set(),
+            frame_label=frame_label,
+            child_labels=child_labels,
+            frame_index=frame_index,
+        )
+
+        if not rendered:
+            return None
+
+        return _composite_parts(rendered)
+
     # ------------------------------------------------------------------
     def get_export_frame_info(self, export_name: str) -> dict[str, Any] | None:
         """Return frame count and labels for an export's root MC."""
@@ -903,3 +932,153 @@ def _additive_blend(
 
     base_arr[y1:y2, x1:x2] = bslice.astype(np.uint8)
     base.paste(Image.fromarray(base_arr))
+
+
+# ======================================================================
+# Champion card compositor
+# ======================================================================
+
+# MC 1008 child indices for card_frame_champion:
+_CARD_CHILD_NOTCH_BASE = 0  # MC 982: full-width notch
+_CARD_CHILD_NOTCH_RIGHT = 1  # MC 987: right half overlay
+_CARD_CHILD_NOTCH_LEFT = 2  # MC 988: left half overlay
+_CARD_CHILD_GLOW = 3  # MC 1001: frame glow border + mask
+_CARD_CHILD_DIAMOND_RIGHT = 5  # MC 1005 @ tx=18.5
+_CARD_CHILD_DIAMOND_LEFT = 6  # MC 1005 @ tx=-18.6
+
+# Glow sub-MCs (990=evo, 1000=hero) have 34 frames. Frames 0-3 are
+# empty, 4-32 show particles/clouds, and frame 33 is a clean border
+# with just the outline shape and clipping mask (no particle effects).
+_GLOW_CLEAN_FRAME = 33
+
+
+def render_champion_card(
+    card_sc: SC5File,
+    card_textures: list[Image.Image | None],
+    portrait_sc: SC5File,
+    portrait_textures: list[Image.Image | None],
+    primary_form: str,
+    secondary_form: str | None = None,
+    portrait_scale: float = 0.55,
+    card_export: str = "card_item_image_colored_champion",
+    mask_export: str = "card_mask_champion",
+) -> Image.Image | None:
+    """Render a complete champion card with portrait and overlay.
+
+    *primary_form*/*secondary_form*: frame labels like ``hero_unlocked``,
+    ``evo_unlocked``.  Primary controls the notch, glow, and right-side
+    diamond; secondary controls the left-side diamond.  If *secondary_form*
+    is ``None``, the primary form is used everywhere.
+
+    Returns a composited RGBA image or ``None`` on failure.
+    """
+    if secondary_form is None:
+        secondary_form = primary_form
+
+    # --- Render card overlay parts individually (preserving blend modes) ---
+    original_find = card_sc._find_frame_by_label
+
+    def _clean_glow_find(mc_id: int, label: str) -> int:
+        mcd = card_sc.movie_clip_data.get(mc_id)
+        if mcd is None:
+            return 0
+        for i, fl in enumerate(mcd.frame_labels):
+            if fl == label:
+                return i
+        # Glow sub-MCs: use clean frame (border only, no particle clouds)
+        if mc_id in (990, 1000):
+            return min(_GLOW_CLEAN_FRAME, len(mcd.frame_element_counts) - 1)
+        for i, c in enumerate(mcd.frame_element_counts):
+            if c > 0:
+                return i
+        return 0
+
+    card_sc._find_frame_by_label = _clean_glow_find
+
+    card_obj = card_sc.exports.get(card_export)
+    if card_obj is None:
+        card_sc._find_frame_by_label = original_find
+        return None
+
+    child_labels = {
+        _CARD_CHILD_NOTCH_BASE: primary_form,
+        _CARD_CHILD_GLOW: primary_form,
+        _CARD_CHILD_DIAMOND_RIGHT: primary_form,
+        _CARD_CHILD_DIAMOND_LEFT: secondary_form,
+    }
+
+    card_parts = card_sc._render_object(
+        card_obj, card_textures, Matrix2x3.IDENTITY, set(),
+        child_labels=child_labels,
+    )
+    card_sc._find_frame_by_label = original_find
+
+    if not card_parts:
+        return None
+
+    # --- Render portrait ---
+    portrait_exports = list(portrait_sc.exports.values())
+    if portrait_exports:
+        portrait_obj = portrait_exports[0]
+    elif portrait_sc.movie_clip_data:
+        portrait_obj = next(iter(portrait_sc.movie_clip_data))
+    else:
+        return None
+
+    portrait_parts = portrait_sc._render_object(
+        portrait_obj, portrait_textures, Matrix2x3.IDENTITY, set(),
+    )
+    if not portrait_parts:
+        return None
+
+    portrait_result = _composite_parts(portrait_parts)
+    if portrait_result is None:
+        return None
+    p_img, p_x, p_y = portrait_result
+
+    # --- Scale and clip portrait to card mask ---
+    mask_result = card_sc.extract_sprite_with_offset(mask_export, card_textures)
+    if mask_result is None:
+        return None
+    m_img, m_x, m_y = mask_result
+    m_alpha = np.array(m_img)[:, :, 3]
+    m_binary = np.where(m_alpha > m_alpha.max() // 2, 255, 0).astype(np.uint8)
+
+    p_scaled = p_img.resize(
+        (int(p_img.width * portrait_scale), int(p_img.height * portrait_scale)),
+        Image.LANCZOS,
+    )
+    sp_x, sp_y = p_x * portrait_scale, p_y * portrait_scale
+
+    clip_mask = Image.new("L", p_scaled.size, 0)
+    clip_mask.paste(
+        Image.fromarray(m_binary),
+        (int(m_x - sp_x + 0.5), int(m_y - sp_y + 0.5)),
+    )
+    p_arr = np.array(p_scaled)
+    cm_arr = np.array(clip_mask)
+    p_arr[:, :, 3] = (
+        p_arr[:, :, 3].astype(np.int32) * cm_arr.astype(np.int32) // 255
+    ).astype(np.uint8)
+    clipped_portrait = Image.fromarray(p_arr)
+
+    # --- Composite everything onto a single canvas ---
+    all_parts = [(clipped_portrait, sp_x, sp_y, 0)] + card_parts
+    xmin = min(x for _, x, _, _ in all_parts) - 1
+    ymin = min(y for _, _, y, _ in all_parts) - 1
+    xmax = max(x + img.width for img, x, _, _ in all_parts) + 1
+    ymax = max(y + img.height for img, _, y, _ in all_parts) + 1
+    cw = int(xmax - xmin + 0.5)
+    ch = int(ymax - ymin + 0.5)
+
+    canvas = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+
+    for img, xo, yo, blend in all_parts:
+        px = int(xo - xmin + 0.5)
+        py = int(yo - ymin + 0.5)
+        if blend == 8:
+            _additive_blend(canvas, img, px, py)
+        else:
+            canvas.alpha_composite(img, (px, py))
+
+    return canvas

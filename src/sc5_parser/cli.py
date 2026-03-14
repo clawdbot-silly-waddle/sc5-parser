@@ -7,11 +7,21 @@ import os
 import sys
 from pathlib import Path
 
-from sc5_parser.parser import SC5File
+from sc5_parser.parser import SC5File, render_champion_card
 from sc5_parser.sctx import decode_sctx
 
 
 def main(argv: list[str] | None = None) -> None:
+    if argv is None:
+        argv = sys.argv[1:]
+
+    # Route to subcommand if first arg is a known subcommand name
+    _subcommands = {"render-card"}
+    if argv and argv[0] in _subcommands:
+        _dispatch_subcommand(argv)
+        return
+
+    # Legacy positional-file mode
     ap = argparse.ArgumentParser(
         prog="sc5-parser",
         description="Parse and extract sprites from Supercell SC v5 files.",
@@ -80,6 +90,60 @@ def main(argv: list[str] | None = None) -> None:
 
     # Default: show info
     _print_info(sc)
+
+
+def _dispatch_subcommand(argv: list[str]) -> None:
+    """Parse and dispatch subcommand-based invocations."""
+    ap = argparse.ArgumentParser(prog="sc5-parser")
+    sub = ap.add_subparsers(dest="command")
+
+    card_p = sub.add_parser(
+        "render-card",
+        help="Render a champion card composite with portrait and overlay.",
+    )
+    card_p.add_argument(
+        "--card-sc", required=True,
+        help="Path to the card UI .sc file (e.g. ui_card_items.sc)",
+    )
+    card_p.add_argument(
+        "--card-sctx",
+        help="Path to the card .sctx file "
+        "(default: auto-detect from card-sc basename)",
+    )
+    card_p.add_argument(
+        "--portrait-sc", required=True,
+        help="Path to the portrait .sc file (e.g. ui_card_knight_hero.sc)",
+    )
+    card_p.add_argument(
+        "--portrait-sctx",
+        help="Path to the portrait .sctx file "
+        "(default: auto-detect from portrait-sc basename)",
+    )
+    card_p.add_argument(
+        "--forms", required=True,
+        help="Comma-separated form labels. First = primary (notch/glow/"
+        "right diamond), second = secondary (left diamond). "
+        "E.g. 'hero_unlocked,evo_unlocked' or just 'hero_unlocked'.",
+    )
+    card_p.add_argument(
+        "--portrait-scale", type=float, default=0.55,
+        help="Scale factor for the portrait (default: 0.55)",
+    )
+    card_p.add_argument(
+        "--zoom", type=int, default=1,
+        help="Upscale factor using nearest-neighbor (default: 1)",
+    )
+    card_p.add_argument(
+        "-o", "--output", default="card.png",
+        help="Output PNG path (default: card.png)",
+    )
+
+    args = ap.parse_args(argv)
+    if args.command == "render-card":
+        _render_card(args)
+    else:
+        ap.print_help()
+        sys.exit(1)
 
 
 # ------------------------------------------------------------------
@@ -223,3 +287,64 @@ def _load_textures(sc: SC5File, sctx_dir: str) -> list:
         else:
             images.append(None)
     return images
+
+
+def _auto_sctx(sc_path: str, explicit: str | None) -> str:
+    """Resolve an .sctx path: use *explicit* if given, else try ``<base>_0.sctx``."""
+    if explicit:
+        return explicit
+    p = Path(sc_path)
+    candidate = p.parent / (p.stem + "_0.sctx")
+    if candidate.exists():
+        return str(candidate)
+    return str(p.parent / (p.stem + ".sctx"))
+
+
+def _render_card(args: argparse.Namespace) -> None:
+    """Handle the ``render-card`` subcommand."""
+    from PIL import Image
+
+    forms = [f.strip() for f in args.forms.split(",")]
+    primary = forms[0]
+    secondary = forms[1] if len(forms) > 1 else None
+
+    if not primary or (secondary is not None and not secondary):
+        print("ERROR: Form labels cannot be empty.", file=sys.stderr)
+        sys.exit(1)
+
+    card_sctx = _auto_sctx(args.card_sc, args.card_sctx)
+    portrait_sctx = _auto_sctx(args.portrait_sc, args.portrait_sctx)
+
+    print(f"Loading card SC:       {args.card_sc}")
+    print(f"Loading card texture:  {card_sctx}")
+    card_sc = SC5File(args.card_sc)
+    card_tex = _load_textures(card_sc, str(Path(card_sctx).parent))
+
+    print(f"Loading portrait SC:   {args.portrait_sc}")
+    print(f"Loading portrait tex:  {portrait_sctx}")
+    portrait_sc = SC5File(args.portrait_sc)
+    portrait_tex = _load_textures(portrait_sc, str(Path(portrait_sctx).parent))
+
+    print(f"Forms: primary={primary}, secondary={secondary or primary}")
+    print(f"Portrait scale: {args.portrait_scale}")
+
+    result = render_champion_card(
+        card_sc, card_tex,
+        portrait_sc, portrait_tex,
+        primary_form=primary,
+        secondary_form=secondary,
+        portrait_scale=args.portrait_scale,
+    )
+
+    if result is None:
+        print("ERROR: Card rendering failed.", file=sys.stderr)
+        sys.exit(1)
+
+    if args.zoom > 1:
+        result = result.resize(
+            (result.width * args.zoom, result.height * args.zoom),
+            Image.NEAREST,
+        )
+
+    result.save(args.output)
+    print(f"Saved: {args.output} ({result.width}×{result.height})")
