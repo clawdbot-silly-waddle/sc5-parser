@@ -1078,21 +1078,29 @@ def render_champion_card(
         del card_sc._render_children
         return None
 
-    child_labels = {
-        _CARD_CHILD_NOTCH_BASE: primary_form,
-        _CARD_CHILD_GLOW: primary_form,
-        _CARD_CHILD_DIAMOND_RIGHT: primary_form,
-        _CARD_CHILD_DIAMOND_LEFT: secondary_form,
-    }
-
-    card_parts = card_sc._render_object(
-        card_obj, card_textures, Matrix2x3.IDENTITY, set(),
-        child_labels=child_labels,
+    # Render three child groups separately so that we can insert the
+    # portrait between the glow border and the overlay parts.  In the
+    # game MC 1008 draws: notch → glow(+portrait inside) → diamonds.
+    _render_args = (card_obj, card_textures, Matrix2x3.IDENTITY, set())
+    notch_parts = card_sc._render_object(
+        *_render_args,
+        child_labels={_CARD_CHILD_NOTCH_BASE: primary_form},
+    )
+    glow_parts = card_sc._render_object(
+        *_render_args,
+        child_labels={_CARD_CHILD_GLOW: primary_form},
+    )
+    diamond_parts = card_sc._render_object(
+        *_render_args,
+        child_labels={
+            _CARD_CHILD_DIAMOND_RIGHT: primary_form,
+            _CARD_CHILD_DIAMOND_LEFT: secondary_form,
+        },
     )
     card_sc._find_frame_by_label = original_find
     del card_sc._render_children
 
-    if not card_parts:
+    if not glow_parts and not notch_parts and not diamond_parts:
         return None
 
     # --- Render portrait ---
@@ -1159,12 +1167,15 @@ def render_champion_card(
     clipped_portrait = Image.fromarray(p_arr)
 
     # --- Composite everything onto a single canvas ---
-    # In the game, the glow (blend=8) renders BEFORE the portrait in
-    # MC 1000's hierarchy, so the portrait covers the glow where it has
-    # content.  Put additive parts first, then portrait, then normal parts.
-    glow_parts = [(im, x, y, b) for im, x, y, b in card_parts if b != 0]
-    front_parts = [(im, x, y, b) for im, x, y, b in card_parts if b == 0]
-    all_parts = glow_parts + [(clipped_portrait, sp_x, sp_y, 0)] + front_parts
+    # Game z-order within MC 1008: notch → glow(additive) → portrait → diamonds.
+    # The glow border sits above the notch but below the portrait; the portrait
+    # covers the glow where it has opaque content.
+    all_parts = (
+        notch_parts
+        + glow_parts
+        + [(clipped_portrait, sp_x, sp_y, 0)]
+        + diamond_parts
+    )
     xmin = min(x for _, x, _, _ in all_parts) - 1
     ymin = min(y for _, _, y, _ in all_parts) - 1
     xmax = max(x + img.width for img, x, _, _ in all_parts) + 1
