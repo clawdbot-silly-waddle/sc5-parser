@@ -901,35 +901,53 @@ def clip_to_mask(
 
 def composite_parts(
     parts: list[tuple[Image.Image, float, float, int]],
+    bounds: tuple[float, float, float, float] | None = None,
 ) -> tuple[Image.Image, float, float] | None:
     """Composite multiple (image, x, y, blend_mode) fragments into one image.
 
-    Blend modes: 0=normal (alpha composite), 8=add (additive).
+    *bounds* – optional ``(xmin, ymin, xmax, ymax)`` canvas extents.
+    When provided the canvas is sized to these bounds instead of being
+    derived from the parts.  Bounds are snapped to integer pixels
+    (``floor`` for min, ``ceil`` for max) so that part positions round
+    consistently regardless of sub-pixel shifts in animated content.
+
+    Returns ``(image, xmin, ymin)`` where *xmin*/*ymin* are the
+    integer-snapped canvas origin, or *None* if the parts list is empty.
+
+    Blend modes: 0 = normal (alpha composite), 8 = additive.
     """
     if not parts:
         return None
 
-    all_x_min = min(xo for _, xo, _, _ in parts)
-    all_y_min = min(yo for _, _, yo, _ in parts)
-    all_x_max = max(xo + im.width for im, xo, _, _ in parts)
-    all_y_max = max(yo + im.height for im, _, yo, _ in parts)
+    import math
 
-    out_w = int(all_x_max - all_x_min + 0.5)
-    out_h = int(all_y_max - all_y_min + 0.5)
+    if bounds is not None:
+        all_x_min = math.floor(bounds[0])
+        all_y_min = math.floor(bounds[1])
+        all_x_max = math.ceil(bounds[2])
+        all_y_max = math.ceil(bounds[3])
+    else:
+        all_x_min = math.floor(min(xo for _, xo, _, _ in parts))
+        all_y_min = math.floor(min(yo for _, _, yo, _ in parts))
+        all_x_max = math.ceil(max(xo + im.width for im, xo, _, _ in parts))
+        all_y_max = math.ceil(max(yo + im.height for im, _, yo, _ in parts))
+
+    out_w = all_x_max - all_x_min
+    out_h = all_y_max - all_y_min
     if out_w <= 0 or out_h <= 0 or out_w > 8192 or out_h > 8192:
         return None
 
     result = Image.new("RGBA", (out_w, out_h), (0, 0, 0, 0))
     for img, xo, yo, blend in parts:
-        px = int(xo - all_x_min)
-        py = int(yo - all_y_min)
+        px = round(xo) - all_x_min
+        py = round(yo) - all_y_min
         if blend == 8:
             # Additive blend: add RGB weighted by overlay alpha, keep base alpha
             additive_blend(result, img, px, py)
         else:
             result.alpha_composite(img, (px, py))
 
-    return result, all_x_min, all_y_min
+    return result, float(all_x_min), float(all_y_min)
 
 
 def additive_blend(

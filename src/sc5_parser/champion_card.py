@@ -34,6 +34,7 @@ Rendering rules
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Callable
 
 from PIL import Image
@@ -42,9 +43,15 @@ from sc5_parser.parser import (
     Matrix2x3,
     RenderContext,
     SC5File,
-    additive_blend,
     composite_parts,
 )
+
+
+@dataclass
+class CardRenderResult:
+    """Result of ``render_champion_card`` including compositing metadata."""
+    image: Image.Image
+    bounds: tuple[float, float, float, float]  # (xmin, ymin, xmax, ymax)
 
 # -- MC 1008 child indices -------------------------------------------------
 
@@ -67,6 +74,11 @@ _GLOW_CLEAN_FRAME = 29
 # matching the interior of the champion frame border.
 _PORTRAIT_MASK_SHAPE = 392
 
+# MC 973 is the diagonal shimmer sweep — it extends well beyond the card
+# bounds and causes visible bouncing when animated.  Excluded from
+# animation by default.
+_SHIMMER_MC = 973
+
 # The game composites a frame border on top of the card base per
 # ``card_forms.toml``.  MC 974 (``card_item_frame``) provides the rounded
 # golden border that matches the in-game reference for champion cards.
@@ -77,17 +89,49 @@ _FRAME_EXPORT = "card_item_frame"
 
 def _make_frame_finder(
     sc: SC5File,
+    animation_frame: int | None = None,
+    animation_exclude: set[int] | None = None,
+    animation_only: set[int] | None = None,
 ) -> Callable[[int, str], int]:
     """Build a frame-finder callback for champion card rendering.
 
     The returned callable resolves frame labels with special handling for
     glow sub-MCs (selecting the clean-border frame) and the champion →
     hero_unlocked alias.
+
+    When *animation_frame* is set, pure-animation MCs (many frames, no
+    meaningful labels) cycle through their frames.  MCs with labelled
+    frames (state variants) are left alone.
+
+    *animation_exclude*: MC IDs to skip even if they match the animation
+    heuristic.
+
+    *animation_only*: when set, ONLY these MC IDs animate (overrides the
+    auto-detection heuristic).
     """
+    # Pre-compute which MCs are pure animations.
+    _anim_ids: set[int] = set()
+    if animation_frame is not None:
+        if animation_only is not None:
+            _anim_ids = animation_only
+        else:
+            exclude = animation_exclude or set()
+            for mid, mcd in sc.movie_clip_data.items():
+                if (mid not in exclude
+                        and len(mcd.frame_element_counts) > 10
+                        and not any(mcd.frame_labels)):
+                    _anim_ids.add(mid)
+
     def _find(mc_id: int, label: str) -> int:
         mcd = sc.movie_clip_data.get(mc_id)
         if mcd is None:
             return 0
+        n_frames = len(mcd.frame_element_counts)
+
+        # Animation mode: cycle pure-animation MCs (no labelled frames).
+        if mc_id in _anim_ids:
+            return animation_frame % n_frames  # type: ignore[operator]
+
         effective = (
             "hero_unlocked" if label == "champion" and mc_id == 1001
             else label
@@ -97,7 +141,7 @@ def _make_frame_finder(
                 return i
         # Glow sub-MCs: use clean frame (border only, no particle clouds)
         if mc_id in (990, 1000):
-            return min(_GLOW_CLEAN_FRAME, len(mcd.frame_element_counts) - 1)
+            return min(_GLOW_CLEAN_FRAME, n_frames - 1)
         for i, c in enumerate(mcd.frame_element_counts):
             if c > 0:
                 return i
@@ -179,7 +223,9 @@ def render_champion_card(
     portrait_scale: float = 0.55,
     card_export: str = "card_item_image_colored_champion",
     render_scale: float = 1.0,
-) -> Image.Image | None:
+    animation_frame: int | None = None,
+    canvas_bounds: tuple[float, float, float, float] | None = None,
+) -> CardRenderResult | None:
     """Render a complete champion card with portrait and overlay.
 
     *primary_form*/*secondary_form*: frame labels like ``hero_unlocked``,
@@ -196,6 +242,14 @@ def render_champion_card(
     produce proportionally larger output with texture sampling at the
     target density, avoiding nearest-neighbour pixelation.
 
+    *animation_frame*: when set, pure-animation MCs (shimmer, glow,
+    diamond glow) cycle through their animation frames.  Render 0..N-1
+    and combine into APNG for animated output.
+
+    *canvas_bounds*: optional ``(xmin, ymin, xmax, ymax)`` to lock the
+    compositing bounding box.  Use this for animation sequences to
+    prevent jitter from per-frame bounding-box variation.
+
     Returns a composited RGBA image or ``None`` on failure.
     """
     if render_scale <= 0:
@@ -205,7 +259,11 @@ def render_champion_card(
     if card_obj is None:
         return None
 
-    frame_finder = _make_frame_finder(card_sc)
+    frame_finder = _make_frame_finder(
+        card_sc,
+        animation_frame=animation_frame,
+        animation_only={_SHIMMER_MC},
+    )
 
     # Base matrix: identity scaled by render_scale for higher-res output.
     base_matrix = (
@@ -295,21 +353,11 @@ def render_champion_card(
         return None
 
     # --- Composite ---------------------------------------------------------
-    xmin = min(x for _, x, _, _ in card_parts) - 1
-    ymin = min(y for _, _, y, _ in card_parts) - 1
-    xmax = max(x + img.width for img, x, _, _ in card_parts) + 1
-    ymax = max(y + img.height for img, _, y, _ in card_parts) + 1
-    cw = int(xmax - xmin + 0.5)
-    ch = int(ymax - ymin + 0.5)
-
-    canvas = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
-
-    for img, xo, yo, blend in card_parts:
-        px = int(xo - xmin + 0.5)
-        py = int(yo - ymin + 0.5)
-        if blend == 8:
-            additive_blend(canvas, img, px, py)
-        else:
-            canvas.alpha_composite(img, (px, py))
-
-    return canvas
+    result = composite_parts(card_parts, bounds=canvas_bounds)
+    if result is None:
+        return None
+    image, ox, oy = result
+    return CardRenderResult(
+        image=image,
+        bounds=(ox, oy, ox + image.width, oy + image.height),
+    )

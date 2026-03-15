@@ -344,5 +344,5 @@ def _render_card(args: argparse.Namespace) -> None:
         print("ERROR: Card rendering failed.", file=sys.stderr)
         sys.exit(1)
 
-    result.save(args.output)
-    print(f"Saved: {args.output} ({result.width}×{result.height})")
+    result.image.save(args.output)
+    print(f"Saved: {args.output} ({result.image.width}×{result.image.height})")
