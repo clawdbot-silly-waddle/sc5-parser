@@ -40,5 +40,9 @@ def decode_sctx(sctx_path: str) -> Image.Image:
         compressed_tex, max_output_size=width * height * 4 * 2
     )
 
+    # Detect format: raw RGBA if size matches w*h*4, otherwise ASTC 8×8
+    if len(tex_data) == width * height * 4:
+        return Image.frombytes("RGBA", (width, height), tex_data, "raw", "BGRA")
+
     decoded = texture2ddecoder.decode_astc(tex_data, width, height, 8, 8)
     return Image.frombytes("RGBA", (width, height), decoded, "raw", "BGRA")
