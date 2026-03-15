@@ -7,6 +7,7 @@ and named exports for downstream extraction.
 
 from __future__ import annotations
 
+import math
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -918,8 +919,6 @@ def composite_parts(
     """
     if not parts:
         return None
-
-    import math
 
     if bounds is not None:
         all_x_min = math.floor(bounds[0])
