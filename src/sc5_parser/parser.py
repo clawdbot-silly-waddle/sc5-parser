@@ -525,18 +525,28 @@ class SC5File:
                 child_names.append("")
         frame_counts: list[int] = []
         frame_labels: list[str] = []
-        for j in range(clip.FramesLength()):
-            frame = clip.Frames(j)
-            frame_counts.append(frame.UsedTransform())
-            lid = frame.LabelRefId()
-            label = self.strings[lid - 1] if 0 < lid <= len(self.strings) else ""
-            frame_labels.append(label)
+        if clip.FramesLength() > 0:
+            for j in range(clip.FramesLength()):
+                frame = clip.Frames(j)
+                frame_counts.append(frame.UsedTransform())
+                lid = frame.LabelRefId()
+                label = self.strings[lid - 1] if 0 < lid <= len(self.strings) else ""
+                frame_labels.append(label)
+        elif hasattr(clip, 'ShortFramesLength') and clip.ShortFramesLength() > 0:
+            # Compact variant: uint16 element count, no frame labels
+            for j in range(clip.ShortFramesLength()):
+                sf = clip.ShortFrames(j)
+                frame_counts.append(sf.UsedTransform())
+                frame_labels.append("")
 
+        frame_count = clip.FramesLength() or (
+            clip.ShortFramesLength() if hasattr(clip, 'ShortFramesLength') else 0
+        )
         self.movie_clips[mc_id] = {
             "id": mc_id,
             "children": children,
             "children_names": child_names,
-            "frame_count": clip.FramesLength(),
+            "frame_count": frame_count,
         }
         children_blending = [clip.ChildrenBlending(j) for j in range(clip.ChildrenBlendingLength())]
         fps = clip.Framerate() or 24

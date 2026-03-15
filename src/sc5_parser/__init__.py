@@ -18,7 +18,7 @@ from sc5_parser.parser import (
     clip_to_mask,
     composite_parts,
 )
-from sc5_parser.sctx import decode_sctx
+from sc5_parser.sctx import decode_pixel_data, decode_sctx
 
 __all__ = [
     "ColorTransform",
@@ -32,5 +32,6 @@ __all__ = [
     "blend_layer",
     "clip_to_mask",
     "composite_parts",
+    "decode_pixel_data",
     "decode_sctx",
 ]
