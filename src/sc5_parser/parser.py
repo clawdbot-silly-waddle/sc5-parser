@@ -17,13 +17,16 @@ import numpy as np
 import zstandard
 from PIL import Image
 
+from sc5_parser._schemas.sc.flash.SC2.CompressedMovieClips import CompressedMovieClips
 from sc5_parser._schemas.sc.flash.SC2.DataStorage import DataStorage
 from sc5_parser._schemas.sc.flash.SC2.ExportNames import ExportNames
+from sc5_parser._schemas.sc.flash.SC2.ExternalMatrixBanks import ExternalMatrixBanks
 from sc5_parser._schemas.sc.flash.SC2.FileDescriptor import FileDescriptor
 from sc5_parser._schemas.sc.flash.SC2.MovieClipModifiers import MovieClipModifiers
 from sc5_parser._schemas.sc.flash.SC2.MovieClips import MovieClips
 from sc5_parser._schemas.sc.flash.SC2.Precision import Precision
 from sc5_parser._schemas.sc.flash.SC2.Shapes import Shapes
+from sc5_parser._schemas.sc.flash.SC2.TextFields import TextFields
 from sc5_parser._schemas.sc.flash.SC2.Textures import Textures
 from sc5_parser.renderer import render_command
 
@@ -122,6 +125,33 @@ class FrameElement:
 
 
 @dataclass
+class TextFieldData:
+    """Parsed TextField display object."""
+    id: int
+    font_name: str = ""
+    text: str = ""
+    typography_file: str = ""
+    left: int = 0
+    top: int = 0
+    right: int = 0
+    bottom: int = 0
+    font_color: int = 0          # RGBA packed uint32
+    outline_color: int = 0       # RGBA packed uint32
+    font_size: int = 0
+    align: int = 0
+    styles: int = 0              # bit flags: bold, italic, multiline, etc.
+
+
+@dataclass
+class ScalingGrid:
+    """9-patch / 9-slice rectangle for a MovieClip."""
+    left: float = 0.0
+    top: float = 0.0
+    right: float = 0.0
+    bottom: float = 0.0
+
+
+@dataclass
 class MovieClipData:
     """Parsed MovieClip with frame element data."""
     id: int
@@ -133,6 +163,7 @@ class MovieClipData:
     frame_element_counts: list[int] = field(default_factory=list)
     frame_labels: list[str] = field(default_factory=list)
     framerate: int = 24  # FPS; 0 means "use default (24)"
+    scaling_grid: ScalingGrid | None = None
 
 
 @dataclass
@@ -174,9 +205,11 @@ class SC5File:
         self.textures: list[dict[str, Any]] = []
         self.movie_clips: dict[int, dict[str, Any]] = {}
         self.movie_clip_data: dict[int, MovieClipData] = {}
+        self.text_fields: dict[int, TextFieldData] = {}  # id → text field
         self.modifiers: dict[int, int] = {}  # id → modifier type (38/39/40)
         self.strings: list[str] = []
         self.vertices: list[tuple[float, float, int, int]] = []
+        self._scaling_rects: list[ScalingGrid] = []  # from DataStorage.rectangles
         self._shape_id_to_idx: dict[int, list[int]] = {}
         self._frame_elements: np.ndarray | None = None
         self._matrix_banks: list[list[Matrix2x3]] = []
@@ -214,6 +247,13 @@ class SC5File:
             comp_data, max_output_size=100 * 1024 * 1024
         )
 
+        # External matrix bank data sits after the compressed inner stream.
+        ext_mb_size = fd.ExternalMatrixBankSize() or 0
+        ext_mb_data: bytes | None = None
+        if ext_mb_size > 0:
+            ext_start = comp_start + (fd.CompressedSize() or 0)
+            ext_mb_data = bytes(raw[ext_start : ext_start + ext_mb_size])
+
         # --- DataStorage --------------------------------------------------
         ds_size = struct.unpack("<I", inner[0:4])[0]
         ds = DataStorage.GetRootAs(bytes(inner[4 : 4 + ds_size]), 0)
@@ -248,6 +288,13 @@ class SC5File:
         else:
             self._frame_elements = np.array([], dtype="<u2")
 
+        # --- Scaling grid rectangles from DataStorage ----------------------
+        for ri in range(ds.RectanglesLength()):
+            r = ds.Rectangles(ri)
+            self._scaling_rects.append(
+                ScalingGrid(left=r.Left(), top=r.Top(), right=r.Right(), bottom=r.Bottom())
+            )
+
         # --- Matrix banks --------------------------------------------------
         for bi in range(ds.MatrixBanksLength()):
             bank_fb = ds.MatrixBanks(bi)
@@ -281,6 +328,61 @@ class SC5File:
                 ))
             self._color_banks.append(colors)
 
+        # --- External matrix banks (appended after the internal banks) -----
+        if ext_mb_data is not None and len(ext_mb_data) >= 4:
+            try:
+                desc_size = struct.unpack_from("<I", ext_mb_data, 0)[0]
+                embs = ExternalMatrixBanks.GetRootAs(
+                    bytes(ext_mb_data[4 : 4 + desc_size]), 0
+                )
+                banks_data_offset = 4 + desc_size
+                for bi in range(embs.BanksLength()):
+                    eb = embs.Banks(bi)
+                    coff = banks_data_offset + eb.CompressedDataOffset()
+                    csz = eb.CompressedDataSize()
+                    dsz = eb.DecompressedDataSize()
+                    if csz == 0 or dsz == 0:
+                        continue
+                    bank_data = zstandard.ZstdDecompressor().decompress(
+                        ext_mb_data[coff : coff + csz],
+                        max_output_size=dsz,
+                    )
+                    ext_matrices: list[Matrix2x3] = []
+                    off = 0
+                    # Float matrices (24 bytes each)
+                    for _ in range(eb.FloatMatrixCount()):
+                        a, b, c, d, tx, ty = struct.unpack_from("<6f", bank_data, off)
+                        ext_matrices.append(Matrix2x3(a=a, b=b, c=c, d=d, tx=tx, ty=ty))
+                        off += 24
+                    # Skip compressed matrix data (complex RLE codec, not decoded here)
+                    off += eb.CompressedMatrixDataSize() * 4
+                    # Short matrices (12 bytes each, hardcoded /1024 and /20 divisors)
+                    for _ in range(eb.ShortMatrixCount()):
+                        sa, sb, sc_, sd, stx, sty = struct.unpack_from("<6h", bank_data, off)
+                        ext_matrices.append(Matrix2x3(
+                            a=sa / 1024.0, b=sb / 1024.0,
+                            c=sc_ / 1024.0, d=sd / 1024.0,
+                            tx=stx / 20.0, ty=sty / 20.0,
+                        ))
+                        off += 12
+                    self._matrix_banks.append(ext_matrices)
+                    # Color transforms (7 bytes each: r_mul, g_mul, b_mul, alpha, r_add, g_add, b_add)
+                    ct_off = (eb.FloatMatrixCount() * 24
+                              + eb.CompressedMatrixDataSize() * 4
+                              + eb.ShortMatrixDataSize() * 2)
+                    ext_colors: list[ColorTransform] = []
+                    for _ in range(eb.ColorTransformCount()):
+                        vals = struct.unpack_from("<7B", bank_data, ct_off)
+                        ext_colors.append(ColorTransform(
+                            r_mul=vals[0], g_mul=vals[1], b_mul=vals[2],
+                            alpha=vals[3],
+                            r_add=vals[4], g_add=vals[5], b_add=vals[6],
+                        ))
+                        ct_off += 7
+                    self._color_banks.append(ext_colors)
+            except Exception:
+                pass  # Graceful degradation if external bank parsing fails
+
         # --- Chunked resources at resources_offset ------------------------
         pos = fd.ResourcesOffset()
 
@@ -299,8 +401,40 @@ class SC5File:
                 self.exports[name] = oid
         pos += 4 + en_size
 
-        # TextFields (skip)
+        # TextFields
         tf_size = struct.unpack("<I", inner[pos : pos + 4])[0]
+        if tf_size > 0:
+            tf = TextFields.GetRootAs(bytes(inner[pos + 4 : pos + 4 + tf_size]), 0)
+            for i in range(tf.TextfieldsLength()):
+                tfd = tf.Textfields(i)
+                tf_id = tfd.Id()
+                font_ref = tfd.FontNameRefId()
+                text_ref = tfd.TextRefId()
+                typo_ref = tfd.TypographyRefId()
+                self.text_fields[tf_id] = TextFieldData(
+                    id=tf_id,
+                    font_name=(
+                        self.strings[font_ref - 1]
+                        if 0 < font_ref <= len(self.strings) else ""
+                    ),
+                    text=(
+                        self.strings[text_ref - 1]
+                        if 0 < text_ref <= len(self.strings) else ""
+                    ),
+                    typography_file=(
+                        self.strings[typo_ref - 1]
+                        if 0 < typo_ref <= len(self.strings) else ""
+                    ),
+                    left=tfd.Left(),
+                    top=tfd.Top(),
+                    right=tfd.Right(),
+                    bottom=tfd.Bottom(),
+                    font_color=tfd.FontColor(),
+                    outline_color=tfd.OutlineColor(),
+                    font_size=tfd.FontSize(),
+                    align=tfd.Align(),
+                    styles=tfd.Styles(),
+                )
         pos += 4 + tf_size
 
         # Shapes
@@ -325,53 +459,21 @@ class SC5File:
             )
         pos += 4 + sh_size
 
-        # MovieClips
+        # MovieClips (regular or compressed variant)
         mc_size = struct.unpack("<I", inner[pos : pos + 4])[0]
-        mc = MovieClips.GetRootAs(
-            bytes(inner[pos + 4 : pos + 4 + mc_size]), 0
-        )
-        for i in range(mc.MovieclipsLength()):
-            clip = mc.Movieclips(i)
-            mc_id = clip.Id()
-            children_ids = [clip.ChildrenIds(j) for j in range(clip.ChildrenIdsLength())]
-            children = [{"id": cid} for cid in children_ids]
-            child_names: list[str] = []
-            for j in range(clip.ChildrenNameRefIdsLength()):
-                ref = clip.ChildrenNameRefIds(j)
-                if 0 < ref <= len(self.strings):
-                    child_names.append(self.strings[ref - 1])
-                else:
-                    child_names.append("")
-            # Frame element counts and labels per frame
-            frame_counts: list[int] = []
-            frame_labels: list[str] = []
-            for j in range(clip.FramesLength()):
-                frame = clip.Frames(j)
-                frame_counts.append(frame.UsedTransform())
-                lid = frame.LabelRefId()
-                label = self.strings[lid - 1] if 0 < lid <= len(self.strings) else ""
-                frame_labels.append(label)
+        mc_buf = bytes(inner[pos + 4 : pos + 4 + mc_size])
+        mc = MovieClips.GetRootAs(mc_buf, 0)
 
-            self.movie_clips[mc_id] = {
-                "id": mc_id,
-                "children": children,
-                "children_names": child_names,
-                "frame_count": clip.FramesLength(),
-            }
-            children_blending = [clip.ChildrenBlending(j) for j in range(clip.ChildrenBlendingLength())]
-            # Framerate: schema default is 0 (meaning "use default"); runtime default is 24 fps
-            fps = clip.Framerate() or 24
-            self.movie_clip_data[mc_id] = MovieClipData(
-                id=mc_id,
-                children_ids=children_ids,
-                children_names=child_names,
-                children_blending=children_blending,
-                frame_elements_offset=clip.FrameElementsOffset(),
-                matrix_bank_index=clip.MatrixBankIndex(),
-                frame_element_counts=frame_counts,
-                frame_labels=frame_labels,
-                framerate=fps,
-            )
+        if mc.MovieclipsLength() > 0:
+            self._parse_movie_clips(mc)
+        else:
+            # Try CompressedMovieClips variant
+            try:
+                cmc = CompressedMovieClips.GetRootAs(mc_buf, 0)
+                if cmc.MovieclipsLength() > 0:
+                    self._parse_compressed_movie_clips(cmc)
+            except Exception:
+                pass  # Neither variant has data
         pos += 4 + mc_size
 
         # MovieClipModifiers
@@ -407,6 +509,78 @@ class SC5File:
                         "external": ext,
                     }
                 )
+
+    # ------------------------------------------------------------------
+    def _parse_movie_clip(self, clip: Any) -> None:
+        """Parse one MovieClip or CompressedMovieClip into internal structures."""
+        mc_id = clip.Id()
+        children_ids = [clip.ChildrenIds(j) for j in range(clip.ChildrenIdsLength())]
+        children = [{"id": cid} for cid in children_ids]
+        child_names: list[str] = []
+        for j in range(clip.ChildrenNameRefIdsLength()):
+            ref = clip.ChildrenNameRefIds(j)
+            if 0 < ref <= len(self.strings):
+                child_names.append(self.strings[ref - 1])
+            else:
+                child_names.append("")
+        frame_counts: list[int] = []
+        frame_labels: list[str] = []
+        for j in range(clip.FramesLength()):
+            frame = clip.Frames(j)
+            frame_counts.append(frame.UsedTransform())
+            lid = frame.LabelRefId()
+            label = self.strings[lid - 1] if 0 < lid <= len(self.strings) else ""
+            frame_labels.append(label)
+
+        self.movie_clips[mc_id] = {
+            "id": mc_id,
+            "children": children,
+            "children_names": child_names,
+            "frame_count": clip.FramesLength(),
+        }
+        children_blending = [clip.ChildrenBlending(j) for j in range(clip.ChildrenBlendingLength())]
+        fps = clip.Framerate() or 24
+
+        # Scaling grid: index into DataStorage.rectangles
+        sg: ScalingGrid | None = None
+        sgi = clip.ScalingGridIndex()
+        if sgi is not None and 0 <= sgi < len(self._scaling_rects):
+            sg = self._scaling_rects[sgi]
+
+        fe_offset = clip.FrameElementsOffset()
+        if fe_offset is None:
+            fe_offset = 0xFFFFFFFF
+
+        self.movie_clip_data[mc_id] = MovieClipData(
+            id=mc_id,
+            children_ids=children_ids,
+            children_names=child_names,
+            children_blending=children_blending,
+            frame_elements_offset=fe_offset,
+            matrix_bank_index=clip.MatrixBankIndex(),
+            frame_element_counts=frame_counts,
+            frame_labels=frame_labels,
+            framerate=fps,
+            scaling_grid=sg,
+        )
+
+    def _parse_movie_clips(self, mc: Any) -> None:
+        """Parse regular MovieClips table."""
+        for i in range(mc.MovieclipsLength()):
+            self._parse_movie_clip(mc.Movieclips(i))
+
+    def _parse_compressed_movie_clips(self, cmc: Any) -> None:
+        """Parse CompressedMovieClips variant.
+
+        CompressedMovieClips share most fields with regular MovieClips
+        (children, blending, frames, etc.).  The key difference is that
+        frame element data may be stored in a compressed binary buffer
+        referenced by ``compressed_data_offset`` rather than in the
+        global frame_elements array.  For now we parse the shared
+        fields; compressed frame data support can be added later.
+        """
+        for i in range(cmc.MovieclipsLength()):
+            self._parse_movie_clip(cmc.Movieclips(i))
 
     # ------------------------------------------------------------------
     def get_frame_elements(self, mc_id: int, frame_idx: int = 0) -> list[FrameElement]:
