@@ -4,12 +4,22 @@ import struct
 import zstandard
 from PIL import Image
 
+# Supercell pixel type codes found in SCTX streaming headers.
+PIXEL_TYPE_BGRA = 70      # Raw BGRA8888
+PIXEL_TYPE_ASTC_4x4 = 204 # ASTC 4×4 block compressed
+PIXEL_TYPE_ASTC_8x8 = 212 # ASTC 8×8 block compressed
+
 
 def decode_sctx(sctx_path: str) -> Image.Image:
     """Decode an SCTX texture file to a PIL RGBA Image.
 
-    SCTX files contain ZSTD-compressed ASTC 8×8 texture data with a
-    streaming header that stores pixel type and dimensions.
+    SCTX files contain a streaming header (FlatBuffer + metadata fields)
+    followed by ZSTD-compressed texture data. The ``pixel_type`` field
+    determines the pixel format:
+
+    * 70  — raw BGRA8888
+    * 204 — ASTC 4×4 block compressed
+    * 212 — ASTC 8×8 block compressed
     """
     import texture2ddecoder
 
@@ -29,7 +39,8 @@ def decode_sctx(sctx_path: str) -> Image.Image:
     header_len = struct.unpack("<I", streaming_data[sd_off : sd_off + 4])[0]
     sd_off += 4
     sd_off += header_len
-    sd_off += 4  # skip pixel_type (we decode ASTC unconditionally)
+    pixel_type = struct.unpack("<I", streaming_data[sd_off : sd_off + 4])[0]
+    sd_off += 4
     width = struct.unpack("<H", streaming_data[sd_off : sd_off + 2])[0]
     sd_off += 2
     height = struct.unpack("<H", streaming_data[sd_off : sd_off + 2])[0]
@@ -40,9 +51,16 @@ def decode_sctx(sctx_path: str) -> Image.Image:
         compressed_tex, max_output_size=width * height * 4 * 2
     )
 
-    # Detect format: raw RGBA if size matches w*h*4, otherwise ASTC 8×8
-    if len(tex_data) == width * height * 4:
+    if pixel_type == PIXEL_TYPE_BGRA:
         return Image.frombytes("RGBA", (width, height), tex_data, "raw", "BGRA")
 
-    decoded = texture2ddecoder.decode_astc(tex_data, width, height, 8, 8)
+    if pixel_type == PIXEL_TYPE_ASTC_4x4:
+        decoded = texture2ddecoder.decode_astc(tex_data, width, height, 4, 4)
+    elif pixel_type == PIXEL_TYPE_ASTC_8x8:
+        decoded = texture2ddecoder.decode_astc(tex_data, width, height, 8, 8)
+    else:
+        raise ValueError(
+            f"Unknown SCTX pixel type {pixel_type} in {sctx_path}"
+        )
+
     return Image.frombytes("RGBA", (width, height), decoded, "raw", "BGRA")
