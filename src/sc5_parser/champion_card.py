@@ -250,7 +250,8 @@ def render_champion_card(
     compositing bounding box.  Use this for animation sequences to
     prevent jitter from per-frame bounding-box variation.
 
-    Returns a composited RGBA image or ``None`` on failure.
+    Returns a `CardRenderResult` with the composited RGBA image and
+    bounding box, or ``None`` on failure.
     """
     if render_scale <= 0:
         raise ValueError("render_scale must be positive")
@@ -353,7 +354,18 @@ def render_champion_card(
         return None
 
     # --- Composite ---------------------------------------------------------
-    result = composite_parts(card_parts, bounds=canvas_bounds)
+    # When no explicit bounds are given, add 1px padding for anti-alias bleed.
+    if canvas_bounds is None:
+        pad_bounds: tuple[float, float, float, float] | None = (
+            min(x for _, x, _, _ in card_parts) - 1,
+            min(y for _, _, y, _ in card_parts) - 1,
+            max(x + img.width for img, x, _, _ in card_parts) + 1,
+            max(y + img.height for img, _, y, _ in card_parts) + 1,
+        )
+    else:
+        pad_bounds = canvas_bounds
+
+    result = composite_parts(card_parts, bounds=pad_bounds)
     if result is None:
         return None
     image, ox, oy = result
