@@ -12,6 +12,7 @@ from sc5_parser.parser import (
     RenderContext,
     SC5File,
     additive_blend,
+    blend_layer,
     clip_to_mask,
     composite_parts,
 )
@@ -24,6 +25,7 @@ __all__ = [
     "RenderContext",
     "SC5File",
     "additive_blend",
+    "blend_layer",
     "clip_to_mask",
     "composite_parts",
     "decode_sctx",

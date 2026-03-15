@@ -22,6 +22,7 @@ from sc5_parser._schemas.sc.flash.SC2.ExportNames import ExportNames
 from sc5_parser._schemas.sc.flash.SC2.FileDescriptor import FileDescriptor
 from sc5_parser._schemas.sc.flash.SC2.MovieClipModifiers import MovieClipModifiers
 from sc5_parser._schemas.sc.flash.SC2.MovieClips import MovieClips
+from sc5_parser._schemas.sc.flash.SC2.Precision import Precision
 from sc5_parser._schemas.sc.flash.SC2.Shapes import Shapes
 from sc5_parser._schemas.sc.flash.SC2.Textures import Textures
 from sc5_parser.renderer import render_command
@@ -35,6 +36,21 @@ _NO_TRANSFORM = 0xFFFF
 _MOD_MASK = 38      # Defines the start of a mask group; next child is the mask shape
 _MOD_MASKED = 39    # Children after this are clipped by the mask
 _MOD_UNMASKED = 40  # End of masked group; children render normally
+
+
+def _precision_divisor(precision: int) -> float:
+    """Return the divisor for a Precision enum value.
+
+    Matches SupercellSWF2CompileTable::get_precision_multiplier in the
+    C++ reference — values were multiplied by this factor during encoding
+    so we divide to recover the original float.
+    """
+    if precision == Precision.Twip:
+        return 20.0
+    if precision == Precision.Optimized:
+        return 1024.0
+    # None_ (0) and Default (1) both use 1.0
+    return 1.0
 
 
 @dataclass
@@ -116,6 +132,7 @@ class MovieClipData:
     matrix_bank_index: int = 0
     frame_element_counts: list[int] = field(default_factory=list)
     frame_labels: list[str] = field(default_factory=list)
+    framerate: int = 24  # FPS; 0 means "use default (24)"
 
 
 @dataclass
@@ -182,6 +199,10 @@ class SC5File:
         fd_buf = bytes(raw[10 : 10 + fd_size])
         fd = FileDescriptor.GetRootAs(fd_buf, 0)
 
+        # Precision divisors for half-precision matrix decoding
+        scale_div = _precision_divisor(fd.ScalePrecision())
+        trans_div = _precision_divisor(fd.TranslationPrecision())
+
         comp_start = 10 + fd_size
         comp_data = (
             raw[comp_start : comp_start + fd.CompressedSize()]
@@ -231,11 +252,24 @@ class SC5File:
         for bi in range(ds.MatrixBanksLength()):
             bank_fb = ds.MatrixBanks(bi)
             matrices: list[Matrix2x3] = []
-            for mi in range(bank_fb.MatricesLength()):
-                m = bank_fb.Matrices(mi)
-                matrices.append(
-                    Matrix2x3(a=m.A(), b=m.B(), c=m.C(), d=m.D(), tx=m.Tx(), ty=m.Ty())
-                )
+            # Prefer full-precision matrices; fall back to half-precision
+            if bank_fb.MatricesLength() > 0:
+                for mi in range(bank_fb.MatricesLength()):
+                    m = bank_fb.Matrices(mi)
+                    matrices.append(
+                        Matrix2x3(a=m.A(), b=m.B(), c=m.C(), d=m.D(), tx=m.Tx(), ty=m.Ty())
+                    )
+            elif bank_fb.HalfMatricesLength() > 0:
+                for mi in range(bank_fb.HalfMatricesLength()):
+                    m = bank_fb.HalfMatrices(mi)
+                    matrices.append(Matrix2x3(
+                        a=m.A() / scale_div,
+                        b=m.B() / scale_div,
+                        c=m.C() / scale_div,
+                        d=m.D() / scale_div,
+                        tx=m.Tx() / trans_div,
+                        ty=m.Ty() / trans_div,
+                    ))
             self._matrix_banks.append(matrices)
             colors: list[ColorTransform] = []
             for ci in range(bank_fb.ColorsLength()):
@@ -325,6 +359,8 @@ class SC5File:
                 "frame_count": clip.FramesLength(),
             }
             children_blending = [clip.ChildrenBlending(j) for j in range(clip.ChildrenBlendingLength())]
+            # Framerate: schema default is 0 (meaning "use default"); runtime default is 24 fps
+            fps = clip.Framerate() or 24
             self.movie_clip_data[mc_id] = MovieClipData(
                 id=mc_id,
                 children_ids=children_ids,
@@ -334,6 +370,7 @@ class SC5File:
                 matrix_bank_index=clip.MatrixBankIndex(),
                 frame_element_counts=frame_counts,
                 frame_labels=frame_labels,
+                framerate=fps,
             )
         pos += 4 + mc_size
 
@@ -930,7 +967,7 @@ def composite_parts(
     Returns ``(image, xmin, ymin)`` where *xmin*/*ymin* are the
     integer-snapped canvas origin, or *None* if the parts list is empty.
 
-    Blend modes: 0 = normal (alpha composite), 8 = additive.
+    Supports all 14 Flash blend modes (0=Normal through 14=HardLight).
     """
     if not parts:
         return None
@@ -955,11 +992,10 @@ def composite_parts(
     for img, xo, yo, blend in parts:
         px = round(xo) - all_x_min
         py = round(yo) - all_y_min
-        if blend == 8:
-            # Additive blend: add RGB weighted by overlay alpha, keep base alpha
-            additive_blend(result, img, px, py)
-        else:
+        if blend == 0:
             result.alpha_composite(img, (px, py))
+        else:
+            blend_layer(result, img, px, py, blend)
 
     return result, float(all_x_min), float(all_y_min)
 
@@ -972,30 +1008,156 @@ def additive_blend(
 ) -> None:
     """In-place additive blend of overlay onto base at (px, py).
 
-    Additive blend adds brightness to existing content without introducing new
-    opacity.  base_rgb += overlay_rgb * overlay_alpha / 255; alpha stays as-is.
+    Kept for backward compatibility.  Delegates to :func:`blend_layer`.
     """
+    blend_layer(base, overlay, px, py, 8)
+
+
+def _clip_regions(
+    base: Image.Image, overlay: Image.Image, px: int, py: int,
+) -> tuple[np.ndarray, np.ndarray, int, int, int, int] | None:
+    """Compute clipped base/overlay array slices. Returns None if no overlap."""
     ow, oh = overlay.size
     bw, bh = base.size
-    # Clip to base bounds
     x1, y1 = max(px, 0), max(py, 0)
     x2, y2 = min(px + ow, bw), min(py + oh, bh)
     if x1 >= x2 or y1 >= y2:
+        return None
+    return (
+        np.array(base)[y1:y2, x1:x2],
+        np.array(overlay)[y1 - py : y2 - py, x1 - px : x2 - px],
+        x1, y1, x2, y2,
+    )
+
+
+def blend_layer(
+    base: Image.Image,
+    overlay: Image.Image,
+    px: int,
+    py: int,
+    blend_mode: int,
+) -> None:
+    """In-place blend *overlay* onto *base* at (px, py) using *blend_mode*.
+
+    Implements all 14 Adobe Flash blend modes used by Supercell:
+
+    ====  ===========  ==========================================
+    Code  Name         Formula (Cb=base, Cs=source, per channel)
+    ====  ===========  ==========================================
+    0     Normal       Standard alpha composite (use alpha_composite instead)
+    2     Layer        Same as Normal (group isolation hint only)
+    3     Multiply     Cb × Cs
+    4     Screen       1 − (1−Cb)(1−Cs)
+    5     Lighten      max(Cb, Cs)
+    6     Darken       min(Cb, Cs)
+    7     Difference   |Cb − Cs|
+    8     Add          Cb + Cs (clamped)
+    9     Subtract     Cb − Cs (clamped ≥ 0)
+    10    Invert       1 − Cb (ignores source RGB)
+    11    Alpha        Uses source alpha only (no RGB change)
+    12    Erase        Removes base alpha where source has alpha
+    13    Overlay      if Cb<½: 2·Cb·Cs  else: 1−2·(1−Cb)·(1−Cs)
+    14    HardLight    if Cs<½: 2·Cb·Cs  else: 1−2·(1−Cb)·(1−Cs)
+    ====  ===========  ==========================================
+
+    All formulas operate on pre-alpha-mixed values in [0, 255].
+    Source alpha controls how much the blend result replaces the base:
+    ``result = base + (blended − base) × src_alpha / 255``
+    """
+    regions = _clip_regions(base, overlay, px, py)
+    if regions is None:
+        return
+    b_slice, o_slice, x1, y1, x2, y2 = regions
+
+    b = b_slice.astype(np.int32)
+    o = o_slice.astype(np.int32)
+    br, bg, bb, ba = b[:,:,0], b[:,:,1], b[:,:,2], b[:,:,3]
+    sr, sg, sb, sa = o[:,:,0], o[:,:,1], o[:,:,2], o[:,:,3]
+
+    if blend_mode == 8:  # Add
+        # For additive, alpha = max so glow is visible in extraction
+        out_a = np.maximum(ba, sa)
+        # Apply source alpha weighting to RGB
+        out_r = np.minimum(br + sr * sa // 255, 255)
+        out_g = np.minimum(bg + sg * sa // 255, 255)
+        out_b = np.minimum(bb + sb * sa // 255, 255)
+        result = np.stack([out_r, out_g, out_b, out_a], axis=2)
+        full = np.array(base)
+        full[y1:y2, x1:x2] = np.clip(result, 0, 255).astype(np.uint8)
+        base.paste(Image.fromarray(full))
         return
 
-    base_arr = np.array(base)
-    over_arr = np.array(overlay)
+    if blend_mode in (0, 2):  # Normal / Layer
+        # Layer (2) is a group isolation hint; compositing is identical.
+        base.alpha_composite(overlay, (px, py))
+        return
 
-    # Slices in base and overlay coordinate systems
-    bslice = base_arr[y1:y2, x1:x2].astype(np.uint16)
-    oslice = over_arr[y1 - py : y2 - py, x1 - px : x2 - px].astype(np.uint16)
+    if blend_mode == 11:  # Alpha — only transfers alpha, no RGB
+        out_a = np.minimum(ba + sa * (255 - ba) // 255, 255)
+        full = np.array(base)
+        full[y1:y2, x1:x2, 3] = np.clip(out_a, 0, 255).astype(np.uint8)
+        base.paste(Image.fromarray(full))
+        return
 
-    alpha = oslice[:, :, 3:4]  # (h, w, 1) broadcast
-    # Add RGB weighted by overlay alpha
-    bslice[:, :, :3] = np.minimum(bslice[:, :, :3] + oslice[:, :, :3] * alpha // 255, 255)
-    # Alpha: take max so additive content is visible in extraction
-    bslice[:, :, 3] = np.maximum(bslice[:, :, 3], oslice[:, :, 3])
+    if blend_mode == 12:  # Erase — removes alpha where source has alpha
+        out_a = ba * (255 - sa) // 255
+        full = np.array(base)
+        full[y1:y2, x1:x2, 3] = np.clip(out_a, 0, 255).astype(np.uint8)
+        base.paste(Image.fromarray(full))
+        return
 
-    base_arr[y1:y2, x1:x2] = bslice.astype(np.uint8)
-    base.paste(Image.fromarray(base_arr))
+    # Standard RGB blend modes: compute blended RGB, then mix by source alpha
+    if blend_mode == 3:  # Multiply
+        cr = br * sr // 255
+        cg = bg * sg // 255
+        cb = bb * sb // 255
+    elif blend_mode == 4:  # Screen
+        cr = br + sr - br * sr // 255
+        cg = bg + sg - bg * sg // 255
+        cb = bb + sb - bb * sb // 255
+    elif blend_mode == 5:  # Lighten
+        cr = np.maximum(br, sr)
+        cg = np.maximum(bg, sg)
+        cb = np.maximum(bb, sb)
+    elif blend_mode == 6:  # Darken
+        cr = np.minimum(br, sr)
+        cg = np.minimum(bg, sg)
+        cb = np.minimum(bb, sb)
+    elif blend_mode == 7:  # Difference
+        cr = np.abs(br - sr)
+        cg = np.abs(bg - sg)
+        cb = np.abs(bb - sb)
+    elif blend_mode == 9:  # Subtract
+        cr = np.maximum(br - sr, 0)
+        cg = np.maximum(bg - sg, 0)
+        cb = np.maximum(bb - sb, 0)
+    elif blend_mode == 10:  # Invert (ignores source RGB, flips base)
+        cr = 255 - br
+        cg = 255 - bg
+        cb = 255 - bb
+    elif blend_mode == 13:  # Overlay
+        cr = np.where(br < 128, 2 * br * sr // 255, 255 - 2 * (255 - br) * (255 - sr) // 255)
+        cg = np.where(bg < 128, 2 * bg * sg // 255, 255 - 2 * (255 - bg) * (255 - sg) // 255)
+        cb = np.where(bb < 128, 2 * bb * sb // 255, 255 - 2 * (255 - bb) * (255 - sb) // 255)
+    elif blend_mode == 14:  # HardLight (Overlay with source/base swapped)
+        cr = np.where(sr < 128, 2 * br * sr // 255, 255 - 2 * (255 - br) * (255 - sr) // 255)
+        cg = np.where(sg < 128, 2 * bg * sg // 255, 255 - 2 * (255 - bg) * (255 - sg) // 255)
+        cb = np.where(sb < 128, 2 * bb * sb // 255, 255 - 2 * (255 - bb) * (255 - sb) // 255)
+    else:
+        # Unknown blend mode — fall back to normal alpha composite
+        base.alpha_composite(overlay, (px, py))
+        return
+
+    # Mix blended result with base by source alpha:
+    # out = base + (blended - base) * src_alpha / 255
+    out_r = br + (cr - br) * sa // 255
+    out_g = bg + (cg - bg) * sa // 255
+    out_b = bb + (cb - bb) * sa // 255
+    # Alpha: standard "over" operator
+    out_a = ba + sa * (255 - ba) // 255
+
+    result = np.stack([out_r, out_g, out_b, out_a], axis=2)
+    full = np.array(base)
+    full[y1:y2, x1:x2] = np.clip(result, 0, 255).astype(np.uint8)
+    base.paste(Image.fromarray(full))
 
