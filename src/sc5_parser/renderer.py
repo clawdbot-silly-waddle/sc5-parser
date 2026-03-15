@@ -31,6 +31,7 @@ def render_command(
     tex_w: int,
     tex_h: int,
     transform: tuple[float, float, float, float, float, float] | None = None,
+    tex_arr: np.ndarray | None = None,
 ) -> tuple[Image.Image | None, float, float]:
     """Rasterise a shape command to an RGBA image.
 
@@ -48,6 +49,9 @@ def render_command(
         vertex XY before rasterisation.  When provided, output coordinates
         are in the transformed space and the texture is sampled at higher
         density (no post-rasterisation upscale needed).
+    tex_arr:
+        Pre-computed ``np.array(tex_img)`` to avoid repeated conversion
+        when rendering multiple commands from the same texture atlas.
 
     Returns
     -------
@@ -79,7 +83,8 @@ def render_command(
     if out_w > MAX_SPRITE_DIM or out_h > MAX_SPRITE_DIM:
         return None, 0, 0
 
-    tex_arr = np.array(tex_img)
+    if tex_arr is None:
+        tex_arr = np.array(tex_img)
     out_arr = np.zeros((out_h, out_w, 4), dtype=np.uint8)
     # Track which pixels were rendered by a triangle that solidly
     # contains them (all barycentric weights >= 0).  Clamped pixels

@@ -458,6 +458,7 @@ class SC5File:
         shape_idx: int,
         texture_images: list[Image.Image | None],
         transform: tuple[float, float, float, float, float, float] | None = None,
+        _tex_arr_cache: dict[int, np.ndarray] | None = None,
     ) -> tuple[Image.Image | None, float, float]:
         """Render a single shape (all commands), return (image, x_off, y_off).
 
@@ -474,14 +475,21 @@ class SC5File:
             tex_img = texture_images[tex_idx]
             if tex_img is None:
                 continue
+            # Reuse cached numpy array for the same texture
+            if _tex_arr_cache is not None:
+                if tex_idx not in _tex_arr_cache:
+                    _tex_arr_cache[tex_idx] = np.array(tex_img)
+                cached_arr = _tex_arr_cache[tex_idx]
+            else:
+                cached_arr = None
             tex = self.textures[tex_idx]
             img, x_off, y_off = render_command(
                 cmd["vertices"], tex_img, tex["width"], tex["height"],
-                transform=transform,
+                transform=transform, tex_arr=cached_arr,
             )
             if img is None or img.size[0] == 0 or img.size[1] == 0:
                 continue
-            if np.array(img)[:, :, 3].max() == 0:
+            if img.getchannel("A").getextrema()[1] == 0:
                 continue
             parts.append((img, x_off, y_off, 0))
         if not parts:
@@ -504,6 +512,7 @@ class SC5File:
         child_labels: dict[int, str] | None = None,
         frame_index: int | None = None,
         ctx: RenderContext | None = None,
+        _tex_arr_cache: dict[int, np.ndarray] | None = None,
     ) -> list[tuple[Image.Image, float, float, int]]:
         """Recursively render an object (shape or movie clip) with transforms.
 
@@ -524,6 +533,9 @@ class SC5File:
         """
         if depth > 50:
             return []
+
+        if _tex_arr_cache is None:
+            _tex_arr_cache = {}
 
         rendered: list[tuple[Image.Image, float, float, int]] = []
 
@@ -546,6 +558,7 @@ class SC5File:
         for si in shape_indices:
             img, x_off, y_off = self._render_shape(
                 si, texture_images, transform=mat_tuple,
+                _tex_arr_cache=_tex_arr_cache,
             )
             if img is None:
                 continue
@@ -655,6 +668,7 @@ class SC5File:
                         effective_label, depth + 1,
                         blend_mode=0,
                         ctx=ctx,
+                        _tex_arr_cache=_tex_arr_cache,
                     )
 
                     # If child has non-zero blend, composite fragments into one image
@@ -721,6 +735,7 @@ class SC5File:
                         color, frame_label, depth + 1,
                         blend_mode=0,
                         ctx=ctx,
+                        _tex_arr_cache=_tex_arr_cache,
                     )
                     if effective_blend != 0 and child_parts and len(child_parts) > 1:
                         comp = composite_parts(
