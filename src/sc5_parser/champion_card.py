@@ -39,11 +39,11 @@ from typing import Callable
 
 from PIL import Image
 
+from sc5_parser.compositor import composite_parts
 from sc5_parser.parser import (
     Matrix2x3,
     RenderContext,
     SC5File,
-    composite_parts,
 )
 
 

@@ -5,6 +5,12 @@ from sc-workshop/SupercellFlash and extracts named sprites from texture
 atlases using polygon UV mapping.
 """
 
+from sc5_parser.compositor import (
+    apply_color_transform,
+    blend_layer,
+    clip_to_mask,
+    composite_parts,
+)
 from sc5_parser.models import (
     ColorTransform,
     Matrix2x3,
@@ -16,10 +22,6 @@ from sc5_parser.models import (
 )
 from sc5_parser.parser import (
     SC5File,
-    apply_color_transform,
-    blend_layer,
-    clip_to_mask,
-    composite_parts,
 )
 from sc5_parser.sctx import decode_pixel_data, decode_sctx
 
