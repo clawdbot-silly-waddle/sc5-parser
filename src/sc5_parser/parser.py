@@ -209,10 +209,10 @@ class SC5File:
         self.strings: list[str] = []
         self.vertices: list[tuple[float, float, int, int]] = []
         self._scaling_rects: list[ScalingGrid] = []  # from DataStorage.rectangles
-        self._shape_id_to_idx: dict[int, list[int]] = {}
+        self.shape_id_to_idx: dict[int, list[int]] = {}
         self._frame_elements: np.ndarray | None = None
-        self._matrix_banks: list[list[Matrix2x3]] = []
-        self._color_banks: list[list[ColorTransform]] = []
+        self.matrix_banks: list[list[Matrix2x3]] = []
+        self.color_banks: list[list[ColorTransform]] = []
         self._parse()
 
     # ------------------------------------------------------------------
@@ -316,7 +316,7 @@ class SC5File:
                         tx=m.Tx() / trans_div,
                         ty=m.Ty() / trans_div,
                     ))
-            self._matrix_banks.append(matrices)
+            self.matrix_banks.append(matrices)
             colors: list[ColorTransform] = []
             for ci in range(bank_fb.ColorsLength()):
                 c = bank_fb.Colors(ci)
@@ -325,7 +325,7 @@ class SC5File:
                     alpha=c.Alpha(),
                     r_add=c.RAdd(), g_add=c.GAdd(), b_add=c.BAdd(),
                 ))
-            self._color_banks.append(colors)
+            self.color_banks.append(colors)
 
         # --- External matrix banks (appended after the internal banks) -----
         if ext_mb_data is not None and len(ext_mb_data) >= 4:
@@ -364,7 +364,7 @@ class SC5File:
                             tx=stx / 20.0, ty=sty / 20.0,
                         ))
                         off += 12
-                    self._matrix_banks.append(ext_matrices)
+                    self.matrix_banks.append(ext_matrices)
                     # Color transforms (7 bytes each: r_mul, g_mul, b_mul, alpha, r_add, g_add, b_add)
                     ct_off = (eb.FloatMatrixCount() * 24
                               + eb.CompressedMatrixDataSize() * 4
@@ -378,7 +378,7 @@ class SC5File:
                             r_add=vals[4], g_add=vals[5], b_add=vals[6],
                         ))
                         ct_off += 7
-                    self._color_banks.append(ext_colors)
+                    self.color_banks.append(ext_colors)
             except Exception:
                 pass  # Graceful degradation if external bank parsing fails
 
@@ -453,7 +453,7 @@ class SC5File:
                 )
             sid = shape.Id()
             self.shapes.append({"id": sid, "commands": commands})
-            self._shape_id_to_idx.setdefault(sid, []).append(
+            self.shape_id_to_idx.setdefault(sid, []).append(
                 len(self.shapes) - 1
             )
         pos += 4 + sh_size
@@ -626,8 +626,8 @@ class SC5File:
             return Matrix2x3.IDENTITY
         mcd = self.movie_clip_data.get(mc_id)
         bank_idx = mcd.matrix_bank_index if mcd else 0
-        if bank_idx < len(self._matrix_banks):
-            bank = self._matrix_banks[bank_idx]
+        if bank_idx < len(self.matrix_banks):
+            bank = self.matrix_banks[bank_idx]
             if matrix_index < len(bank):
                 return bank[matrix_index]
         return Matrix2x3.IDENTITY
@@ -638,8 +638,8 @@ class SC5File:
             return ColorTransform.IDENTITY
         mcd = self.movie_clip_data.get(mc_id)
         bank_idx = mcd.matrix_bank_index if mcd else 0
-        if bank_idx < len(self._color_banks):
-            bank = self._color_banks[bank_idx]
+        if bank_idx < len(self.color_banks):
+            bank = self.color_banks[bank_idx]
             if color_index < len(bank):
                 return bank[color_index]
         return ColorTransform.IDENTITY
@@ -656,7 +656,7 @@ class SC5File:
         if obj_id in visited:
             return []
         visited.add(obj_id)
-        indices = list(self._shape_id_to_idx.get(obj_id, []))
+        indices = list(self.shape_id_to_idx.get(obj_id, []))
         mcd = self.movie_clip_data.get(obj_id)
         if mcd:
             for child_id in mcd.children_ids:
@@ -754,7 +754,7 @@ class SC5File:
         # vertex coordinates so the texture is sampled at full target
         # resolution (no lossy post-rasterisation upscale).
         # Pure translations skip the transform (just offset the result).
-        shape_indices = self._shape_id_to_idx.get(obj_id, [])
+        shape_indices = self.shape_id_to_idx.get(obj_id, [])
         _pure_xlate = (
             parent_matrix.a == 1 and parent_matrix.b == 0
             and parent_matrix.c == 0 and parent_matrix.d == 1
