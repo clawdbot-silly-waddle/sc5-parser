@@ -6,7 +6,7 @@ Pure data classes with no rendering or image-processing dependencies.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
 
 ShapeDict = dict[str, Any]
@@ -22,7 +22,7 @@ class Matrix2x3:
     tx: float = 0.0
     ty: float = 0.0
 
-    IDENTITY: Matrix2x3 = None  # type: ignore[assignment]  # set below
+    IDENTITY: ClassVar[Matrix2x3]
 
     def __matmul__(self, other: Matrix2x3) -> Matrix2x3:
         """Compose two 2×3 affine matrices: ``self @ other``."""
@@ -50,7 +50,7 @@ class ColorTransform:
     g_add: int = 0
     b_add: int = 0
 
-    IDENTITY: ColorTransform = None  # type: ignore[assignment]
+    IDENTITY: ClassVar[ColorTransform]
 
 
 ColorTransform.IDENTITY = ColorTransform()
