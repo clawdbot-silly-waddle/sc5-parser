@@ -41,6 +41,12 @@ from sc5_parser.models import (
 # Sentinel: "no matrix" / "no color transform" in frame elements
 _NO_TRANSFORM = 0xFFFF
 
+# Sentinel: movie clip has no frame element data at all
+_NO_FRAME_ELEMENTS = 0xFFFFFFFF
+
+# Maximum decompressed size for ZSTD streams (100 MiB)
+_MAX_DECOMPRESS_SIZE = 100 * 1024 * 1024
+
 # MovieClipModifier types
 _MOD_MASK = 38      # Defines the start of a mask group; next child is the mask shape
 _MOD_MASKED = 39    # Children after this are clipped by the mask
@@ -110,7 +116,7 @@ class SC5File:
         )
 
         inner = zstandard.ZstdDecompressor().decompress(
-            comp_data, max_output_size=100 * 1024 * 1024
+            comp_data, max_output_size=_MAX_DECOMPRESS_SIZE
         )
 
         # External matrix bank data sits after the compressed inner stream.
@@ -422,7 +428,7 @@ class SC5File:
 
         fe_offset = clip.FrameElementsOffset()
         if fe_offset is None:
-            fe_offset = 0xFFFFFFFF
+            fe_offset = _NO_FRAME_ELEMENTS
 
         self.movie_clip_data[mc_id] = MovieClipData(
             id=mc_id,
@@ -461,7 +467,7 @@ class SC5File:
         mcd = self.movie_clip_data.get(mc_id)
         if mcd is None or not mcd.frame_element_counts:
             return []
-        if mcd.frame_elements_offset == 0xFFFFFFFF:
+        if mcd.frame_elements_offset == _NO_FRAME_ELEMENTS:
             return []
         if frame_idx < 0 or frame_idx >= len(mcd.frame_element_counts):
             return []

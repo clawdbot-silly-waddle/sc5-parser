@@ -13,6 +13,9 @@ from PIL import Image
 
 MAX_SPRITE_DIM = 4096
 
+# UV coordinate divisor (16-bit range → normalized)
+_UV_DIVISOR = 65535.0
+
 
 def triangulate_strip(n: int) -> list[tuple[int, int, int]]:
     """Return triangle index triples from *n* triangle-strip vertices."""
@@ -96,12 +99,12 @@ def render_command(
         x1, y1, u1_raw, v1_raw = verts[i1]
         x2, y2, u2_raw, v2_raw = verts[i2]
 
-        tu0 = u0_raw / 65535.0 * tex_w
-        tv0 = v0_raw / 65535.0 * tex_h
-        tu1 = u1_raw / 65535.0 * tex_w
-        tv1 = v1_raw / 65535.0 * tex_h
-        tu2 = u2_raw / 65535.0 * tex_w
-        tv2 = v2_raw / 65535.0 * tex_h
+        tu0 = u0_raw / _UV_DIVISOR * tex_w
+        tv0 = v0_raw / _UV_DIVISOR * tex_h
+        tu1 = u1_raw / _UV_DIVISOR * tex_w
+        tv1 = v1_raw / _UV_DIVISOR * tex_h
+        tu2 = u2_raw / _UV_DIVISOR * tex_w
+        tv2 = v2_raw / _UV_DIVISOR * tex_h
 
         ox0 = x0 - x_min
         oy0 = y0 - y_min

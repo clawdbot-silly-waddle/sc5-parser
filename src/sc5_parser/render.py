@@ -23,6 +23,15 @@ _MOD_MASK = 38
 _MOD_MASKED = 39
 _MOD_UNMASKED = 40
 
+# Sentinel: movie clip has no frame element data
+_NO_FRAME_ELEMENTS = 0xFFFFFFFF
+
+# Maximum recursion depth for render_object
+_MAX_RENDER_DEPTH = 50
+
+# UV coordinate divisor (16-bit range → normalized)
+_UV_DIVISOR = 65535.0
+
 
 def find_shapes_for_export(sc: SC5File, export_name: str) -> list[int]:
     """Return shape-list indices for every shape reachable from *export_name*."""
@@ -126,7 +135,7 @@ def render_object(
 
     Returns list of (image, global_x, global_y, blend_mode) tuples ready for final compositing.
     """
-    if depth > 50:
+    if depth > _MAX_RENDER_DEPTH:
         return []
 
     if _tex_arr_cache is None:
@@ -316,7 +325,7 @@ def render_object(
                     rendered.extend(
                         ctx.overlay_after_child[elem.child_index]
                     )
-        elif mcd.frame_elements_offset == 0xFFFFFFFF:
+        elif mcd.frame_elements_offset == _NO_FRAME_ELEMENTS:
             # No frame element data at all - render children with identity
             for idx, child_id in enumerate(mcd.children_ids):
                 child_blend = (
@@ -454,8 +463,8 @@ def get_shape_bounds(sc: SC5File, shape_idx: int) -> dict[str, Any] | None:
         tex = sc.textures[tex_idx]
         w, h = tex["width"], tex["height"]
         for _x, _y, u, v in cmd["vertices"]:
-            all_us.append(u / 65535.0 * w)
-            all_vs.append(v / 65535.0 * h)
+            all_us.append(u / _UV_DIVISOR * w)
+            all_vs.append(v / _UV_DIVISOR * h)
     if not all_us:
         return None
     return {
