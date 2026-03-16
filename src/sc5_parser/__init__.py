@@ -23,6 +23,16 @@ from sc5_parser.models import (
 from sc5_parser.parser import (
     SC5File,
 )
+from sc5_parser.render import (
+    collect_shapes,
+    extract_sprite,
+    extract_sprite_with_offset,
+    find_shapes_for_export,
+    get_export_frame_info,
+    get_shape_bounds,
+    render_object,
+    render_shape,
+)
 from sc5_parser.sctx import decode_pixel_data, decode_sctx
 
 __all__ = [
@@ -37,7 +47,15 @@ __all__ = [
     "apply_color_transform",
     "blend_layer",
     "clip_to_mask",
+    "collect_shapes",
     "composite_parts",
     "decode_pixel_data",
     "decode_sctx",
+    "extract_sprite",
+    "extract_sprite_with_offset",
+    "find_shapes_for_export",
+    "get_export_frame_info",
+    "get_shape_bounds",
+    "render_object",
+    "render_shape",
 ]
