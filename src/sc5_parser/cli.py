@@ -151,7 +151,7 @@ def _dispatch_subcommand(argv: list[str]) -> None:
 def _print_info(sc: SC5File) -> None:
     print(f"File:        {sc.sc_path}")
     print(f"Shapes:      {len(sc.shapes)}")
-    print(f"Movie clips: {len(sc.movie_clips)}")
+    print(f"Movie clips: {len(sc.movie_clip_data)}")
     print(f"Textures:    {len(sc.textures)}")
     print(f"Exports:     {len(sc.exports)}")
     print(f"Vertices:    {len(sc.vertices)}")

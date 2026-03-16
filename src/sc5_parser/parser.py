@@ -203,7 +203,6 @@ class SC5File:
         self.shapes: list[ShapeDict] = []
         self.exports: dict[str, int] = {}  # name → movie-clip / shape id
         self.textures: list[dict[str, Any]] = []
-        self.movie_clips: dict[int, dict[str, Any]] = {}
         self.movie_clip_data: dict[int, MovieClipData] = {}
         self.text_fields: dict[int, TextFieldData] = {}  # id → text field
         self.modifiers: dict[int, int] = {}  # id → modifier type (38/39/40)
@@ -539,15 +538,6 @@ class SC5File:
                 frame_counts.append(sf.UsedTransform())
                 frame_labels.append("")
 
-        frame_count = clip.FramesLength() or (
-            clip.ShortFramesLength() if hasattr(clip, 'ShortFramesLength') else 0
-        )
-        self.movie_clips[mc_id] = {
-            "id": mc_id,
-            "children": children,
-            "children_names": child_names,
-            "frame_count": frame_count,
-        }
         children_blending = [clip.ChildrenBlending(j) for j in range(clip.ChildrenBlendingLength())]
         fps = clip.Framerate() or 24
 
@@ -667,10 +657,10 @@ class SC5File:
             return []
         visited.add(obj_id)
         indices = list(self._shape_id_to_idx.get(obj_id, []))
-        mc = self.movie_clips.get(obj_id)
-        if mc:
-            for child in mc["children"]:
-                indices.extend(self._collect_shapes(child["id"], visited))
+        mcd = self.movie_clip_data.get(obj_id)
+        if mcd:
+            for child_id in mcd.children_ids:
+                indices.extend(self._collect_shapes(child_id, visited))
         return indices
 
     # ------------------------------------------------------------------
