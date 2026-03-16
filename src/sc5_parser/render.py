@@ -33,6 +33,24 @@ _MAX_RENDER_DEPTH = 50
 _UV_DIVISOR = 65535.0
 
 
+def _apply_blend(
+    child_parts: list[tuple[Image.Image, float, float, int]],
+    effective_blend: int,
+) -> list[tuple[Image.Image, float, float, int]]:
+    """Consolidate *child_parts* under a single blend mode if non-zero."""
+    if effective_blend == 0 or not child_parts:
+        return child_parts
+    if len(child_parts) > 1:
+        comp = composite_parts(
+            [(im, x, y, 0) for im, x, y, _ in child_parts]
+        )
+        if comp:
+            c_img, c_x, c_y = comp
+            return [(c_img, c_x, c_y, effective_blend)]
+        return []
+    return [(im, x, y, effective_blend) for im, x, y, _ in child_parts]
+
+
 def find_shapes_for_export(sc: SC5File, export_name: str) -> list[int]:
     """Return shape-list indices for every shape reachable from *export_name*."""
     mc_id = sc.exports.get(export_name)
@@ -278,18 +296,7 @@ def render_object(
                 # If child has non-zero blend, composite fragments into one image
                 # first, then apply the blend to the single result
                 effective_blend = child_blend if child_blend != 0 else blend_mode
-                if effective_blend != 0 and child_parts and len(child_parts) > 1:
-                    comp = composite_parts(
-                        [(im, x, y, 0) for im, x, y, _ in child_parts]
-                    )
-                    if comp:
-                        c_img, c_x, c_y = comp
-                        child_parts = [(c_img, c_x, c_y, effective_blend)]
-                    else:
-                        child_parts = []
-                elif effective_blend != 0 and child_parts:
-                    child_parts = [(im, x, y, effective_blend)
-                                   for im, x, y, _ in child_parts]
+                child_parts = _apply_blend(child_parts, effective_blend)
 
                 if capture_mask:
                     # Composite this child into a single mask image
@@ -341,18 +348,7 @@ def render_object(
                     ctx=ctx,
                     _tex_arr_cache=_tex_arr_cache,
                 )
-                if effective_blend != 0 and child_parts and len(child_parts) > 1:
-                    comp = composite_parts(
-                        [(im, x, y, 0) for im, x, y, _ in child_parts]
-                    )
-                    if comp:
-                        c_img, c_x, c_y = comp
-                        child_parts = [(c_img, c_x, c_y, effective_blend)]
-                    else:
-                        child_parts = []
-                elif effective_blend != 0 and child_parts:
-                    child_parts = [(im, x, y, effective_blend)
-                                   for im, x, y, _ in child_parts]
+                child_parts = _apply_blend(child_parts, effective_blend)
                 rendered.extend(child_parts)
         # else: selected frame explicitly has 0 elements - nothing visible
 
