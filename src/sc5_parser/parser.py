@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import struct
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -380,7 +381,10 @@ class SC5File:
                         ct_off += 7
                     self.color_banks.append(ext_colors)
             except Exception:
-                pass  # Graceful degradation if external bank parsing fails
+                warnings.warn(
+                    f"Failed to parse external matrix/color banks in {self.sc_path}",
+                    stacklevel=2,
+                )
 
         # --- Chunked resources at resources_offset ------------------------
         pos = fd.ResourcesOffset()
@@ -472,7 +476,10 @@ class SC5File:
                 if cmc.MovieclipsLength() > 0:
                     self._parse_compressed_movie_clips(cmc)
             except Exception:
-                pass  # Neither variant has data
+                warnings.warn(
+                    f"Failed to parse compressed movie clips in {self.sc_path}",
+                    stacklevel=2,
+                )
         pos += 4 + mc_size
 
         # MovieClipModifiers
