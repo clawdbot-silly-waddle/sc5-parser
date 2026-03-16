@@ -1181,19 +1181,6 @@ def composite_parts(
     return result, float(all_x_min), float(all_y_min)
 
 
-def additive_blend(
-    base: Image.Image,
-    overlay: Image.Image,
-    px: int,
-    py: int,
-) -> None:
-    """In-place additive blend of overlay onto base at (px, py).
-
-    Kept for backward compatibility.  Delegates to :func:`blend_layer`.
-    """
-    blend_layer(base, overlay, px, py, 8)
-
-
 def _clip_regions(
     base: Image.Image, overlay: Image.Image, px: int, py: int,
 ) -> tuple[np.ndarray, np.ndarray, int, int, int, int] | None:
